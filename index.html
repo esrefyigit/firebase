@@ -1,1 +1,1652 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#2563eb">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Sipariş Sistemi</title>
 
+    <link rel="manifest" id="my-manifest-placeholder">
+    <link rel="apple-touch-icon" href="https://cdn-icons-png.flaticon.com/512/3448/3448609.png">
+
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js";
+        import {
+            getFirestore, collection, doc,
+            getDocs, getDoc, addDoc, setDoc, updateDoc, deleteDoc,
+            query, where, onSnapshot, orderBy, serverTimestamp, writeBatch, Timestamp
+        } from "https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js";
+
+        // ── Firebase Config ──────────────────────────────────────────────
+        const firebaseConfig = {
+            apiKey: "AIzaSyBSW6QoYWnE_b6SMgJ8kWl51aAgxhx2Ijs",
+            authDomain: "siparissistemi-f8d5f.firebaseapp.com",
+            projectId: "siparissistemi-f8d5f",
+            storageBucket: "siparissistemi-f8d5f.firebasestorage.app",
+            messagingSenderId: "46698222948",
+            appId: "1:46698222948:web:5500e161d2dcf873ea9671"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db  = getFirestore(app);
+
+        // ── Türkçe timestamp yardımcısı ──────────────────────────────────
+        function nowTR() {
+            return new Date().toLocaleString('tr-TR');
+        }
+
+        // ── Koleksiyon referansları ──────────────────────────────────────
+        const Col = {
+            users:    () => collection(db, 'users'),
+            products: () => collection(db, 'products'),
+            tables:   () => collection(db, 'tables'),
+            orders:   () => collection(db, 'orders'),
+        };
+
+        // ================================================================
+        // DB KATMANI  –  GAS runGas() fonksiyonlarının Firestore karşılıkları
+        // ================================================================
+
+        // LOGIN
+        async function handleLogin({ userId, pass }) {
+            const snap = await getDocs(query(Col.users(), where('id', '==', userId), where('sifre', '==', pass)));
+            if (snap.empty) throw new Error('Kullanıcı bulunamadı veya şifre hatalı.');
+            const data = snap.docs[0].data();
+            return { ...data, _docId: snap.docs[0].id };
+        }
+
+        // USERS
+        async function getUsers() {
+            const snap = await getDocs(Col.users());
+            return snap.docs.map(d => ({ ...d.data(), _docId: d.id }));
+        }
+        async function handleAddUser({ newUser }) {
+            const existing = await getDocs(query(Col.users(), where('id', '==', newUser.id)));
+            if (!existing.empty) throw new Error('Bu ID zaten kullanılıyor.');
+            await addDoc(Col.users(), { ...newUser });
+        }
+        async function handleUpdateUser({ originalId, updatedUser }) {
+            const snap = await getDocs(query(Col.users(), where('id', '==', originalId)));
+            if (snap.empty) throw new Error('Kullanıcı bulunamadı.');
+            const ref = snap.docs[0].ref;
+            const update = { adsoyad: updatedUser.adsoyad, rol: updatedUser.rol };
+            if (updatedUser.sifre) update.sifre = updatedUser.sifre;
+            await updateDoc(ref, update);
+        }
+        async function handleDeleteUser({ userId }) {
+            const snap = await getDocs(query(Col.users(), where('id', '==', userId)));
+            if (!snap.empty) await deleteDoc(snap.docs[0].ref);
+        }
+
+        // PRODUCTS
+        async function getProducts() {
+            const snap = await getDocs(Col.products());
+            return snap.docs.map(d => ({ ...d.data(), id: d.id })).sort((a,b)=>a.ad.localeCompare(b.ad));
+        }
+        async function handleAddProduct({ newProduct }) {
+            await addDoc(Col.products(), newProduct);
+        }
+        async function handleUpdateProduct({ originalId, updatedProduct }) {
+            await updateDoc(doc(db, 'products', originalId), updatedProduct);
+        }
+        async function handleDeleteProduct({ productId }) {
+            await deleteDoc(doc(db, 'products', productId));
+        }
+
+        // TABLES
+        async function getTables() {
+            const snap = await getDocs(Col.tables());
+            return snap.docs.map(d => ({ ...d.data(), _docId: d.id }));
+        }
+        async function handleAddTable(masano) {
+            const existing = await getDocs(query(Col.tables(), where('masano', '==', Number(masano))));
+            if (!existing.empty) throw new Error('Bu masa numarası zaten var.');
+            await addDoc(Col.tables(), { masano: Number(masano), garson: '' });
+        }
+        async function handleDeleteTable({ masano }) {
+            const snap = await getDocs(query(Col.tables(), where('masano', '==', Number(masano))));
+            if (!snap.empty) await deleteDoc(snap.docs[0].ref);
+        }
+        async function handleUpdateTableWaiter(masano, garson) {
+            const snap = await getDocs(query(Col.tables(), where('masano', '==', Number(masano))));
+            if (!snap.empty) await updateDoc(snap.docs[0].ref, { garson });
+        }
+
+        // ORDERS  –  Firestore'da her ürün satırı ayrı belge
+        async function getOrders() {
+            const snap = await getDocs(Col.orders());
+            return snap.docs.map(d => ({ ...d.data(), _docId: d.id }));
+        }
+
+        async function handleSaveOrder(orderData) {
+            const { masaNo, garson, urunler, barmen, not: notText } = orderData;
+            const siparisId = `SP-${Date.now()}`;
+            const siparissaati = nowTR();
+            const tarih = siparissaati.split(' ')[0];
+            const batch = writeBatch(db);
+            urunler.forEach(u => {
+                const ref = doc(Col.orders());
+                batch.set(ref, {
+                    siparisid: siparisId,
+                    masano: String(masaNo),
+                    garson, barmen,
+                    urun: u.urun,
+                    miktar: u.miktar,
+                    fiyat: u.fiyat,
+                    not: notText || '',
+                    durumu: 'Barda',
+                    siparissaati,
+                    barmenssaati: '',
+                    odemesaati: '',
+                    kasaci: '',
+                    tarih,
+                    _ts: serverTimestamp()
+                });
+            });
+            await batch.commit();
+        }
+
+        async function handleUpdateStatusMultiple({ ids, newStatus, kasaci }) {
+            // ids: siparisId (SP-xxx) dizisi – her birinin tüm satırlarını bul
+            const batch = writeBatch(db);
+            const saatAlan = newStatus === 'Hazır' ? 'barmenssaati'
+                           : newStatus === 'Kasada' ? 'barmenssaati'
+                           : newStatus === 'Ödendi' ? 'odemesaati' : null;
+            const zaman = nowTR().split(' ')[1].slice(0,5); // HH:mm
+ 
+            // Firestore'un 'in' operatörü en fazla 10 değer alabilir.
+            // Bu nedenle ids dizisini 10'arlı parçalara bölüyoruz.
+            const chunkSize = 10;
+            for (let i = 0; i < ids.length; i += chunkSize) {
+                const chunk = ids.slice(i, i + chunkSize);
+                const snap = await getDocs(query(Col.orders(), where('siparisid', 'in', chunk)));
+                snap.docs.forEach(d => {
+                    const upd = { durumu: newStatus };
+                    if (saatAlan) upd[saatAlan] = zaman;
+                    if (kasaci !== undefined && kasaci !== null) upd.kasaci = kasaci;
+                    batch.update(d.ref, upd);
+                });
+            }
+ 
+            // Hata ayıklama için console.error ekleyelim
+            // console.error("Hata oluştu:", err);
+            await batch.commit();
+        }
+
+        async function handleDeleteOrder({ siparisId }) {
+            const snap = await getDocs(query(Col.orders(), where('siparisid', '==', siparisId)));
+            const batch = writeBatch(db);
+            snap.docs.forEach(d => batch.delete(d.ref));
+            await batch.commit();
+        }
+
+        // ================================================================
+        // onSnapshot LİSTENER YÖNETİMİ
+        // ================================================================
+        const _listeners = {};  // key → unsubscribe fn
+
+        function subscribeOrders(key, callback) {
+            if (_listeners[key]) { _listeners[key](); delete _listeners[key]; }
+            const unsub = onSnapshot(Col.orders(), snap => {
+                callback(snap.docs.map(d => ({ ...d.data(), _docId: d.id })));
+            });
+            _listeners[key] = unsub;
+        }
+
+        function unsubscribeKey(key) {
+            if (_listeners[key]) { _listeners[key](); delete _listeners[key]; }
+        }
+
+        function unsubscribeAll() {
+            Object.keys(_listeners).forEach(k => { _listeners[k](); delete _listeners[k]; });
+        }
+
+        // ================================================================
+        // Global API – window.DB üzerinden UI katmanına aç
+        // ================================================================
+        window.DB = {
+            handleLogin,
+            getUsers, handleAddUser, handleUpdateUser, handleDeleteUser,
+            getProducts, handleAddProduct, handleUpdateProduct, handleDeleteProduct,
+            getTables, handleAddTable, handleDeleteTable, handleUpdateTableWaiter,
+            getOrders, handleSaveOrder, handleUpdateStatusMultiple, handleDeleteOrder,
+            subscribeOrders, unsubscribeKey, unsubscribeAll,
+        };
+
+        // DB hazır olduğunu UI'ya bildir
+        window._dbReady = true;
+        document.dispatchEvent(new Event('db-ready'));
+    </script>
+
+    <style>
+        :root {
+            --primary-color: #4361ee;
+            --primary-light: #e0e7ff;
+            --secondary-color: #3a0ca3;
+            --success-color: #06d6a0;
+            --warning-color: #ffd166;
+            --danger-color: #ef476f;
+            --dark-color: #1e293b;
+            --light-color: #f8fafc;
+            --gray-color: #64748b;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            -webkit-tap-highlight-color: transparent;
+            overscroll-behavior-y: none;
+            background-color: #f8fafc;
+            transition: background-color 0.3s, color 0.3s;
+        }
+        body.dark-mode { background-color: #111827; color: #f3f4f6; }
+        body.dark-mode .card, body.dark-mode .bg-white { background-color: #1f2937 !important; color: #f3f4f6 !important; border-color: #374151 !important; }
+        body.dark-mode .text-gray-800, body.dark-mode .text-gray-700 { color: #f3f4f6 !important; }
+        body.dark-mode .text-gray-500, body.dark-mode .text-gray-600 { color: #d1d5db !important; }
+        body.dark-mode .bg-gray-50, body.dark-mode .bg-gray-100 { background-color: #374151 !important; }
+        body.dark-mode .border-gray-200, body.dark-mode .border-gray-100 { border-color: #4b5563 !important; }
+        body.dark-mode input, body.dark-mode select, body.dark-mode textarea { background-color: #374151 !important; color: #f3f4f6 !important; border-color: #4b5563 !important; }
+        body.dark-mode #loginPanel { background: linear-gradient(to bottom right, #1e293b, #0f172a) !important; }
+        body.dark-mode #loginPanel .bg-white { background-color: #1f2937 !important; color: #f3f4f6; }
+        body.dark-mode #loginPanel input { background-color: #374151 !important; color: #f3f4f6 !important; border-color: #4b5563 !important; }
+
+        .tab-content { display: none; }
+        .active { display: block !important; }
+        .rotate-180 { transform: rotate(180deg); }
+
+        .accordion-content {
+            overflow: hidden;
+            transition: max-height 0.3s ease-out, opacity 0.3s ease-out, padding 0.3s ease-out;
+            max-height: 0; opacity: 0; padding-top: 0; padding-bottom: 0;
+        }
+        .accordion-content.expanded { max-height: 2000px; opacity: 1; padding-top: 1rem; padding-bottom: 1rem; }
+
+        .card {
+            background: white; border-radius: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            border: 1px solid #e2e8f0;
+            transition: all 0.3s ease;
+        }
+        .card:hover { box-shadow: 0 10px 30px rgba(0,0,0,0.12); transform: translateY(-4px); }
+
+        @keyframes fadeInUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+        .animate-fade-in-up { animation: fadeInUp 0.6s ease-out; }
+
+        .big-toast {
+            position: fixed !important; top: 50% !important; left: 50% !important;
+            transform: translate(-50%, -50%) !important; z-index: 99999 !important;
+            min-width: 320px !important; max-width: 90% !important;
+            padding: 28px 40px !important; border-radius: 24px !important;
+            font-size: 26px !important; font-weight: 700 !important;
+            text-align: center !important;
+            box-shadow: 0 35px 70px rgba(0,0,0,0.4) !important;
+            animation: bigToastIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275),
+                       bigToastOut 0.4s ease-in 2.6s forwards !important;
+            pointer-events: none !important;
+            display: flex !important; align-items: center !important;
+            justify-content: center !important; gap: 20px !important;
+        }
+        .big-toast.success { background: linear-gradient(135deg,#10b981,#059669) !important; color:white !important; }
+        .big-toast.error   { background: linear-gradient(135deg,#ef4444,#dc2626) !important; color:white !important; }
+        .big-toast.info    { background: linear-gradient(135deg,#3b82f6,#2563eb) !important; color:white !important; }
+        @keyframes bigToastIn  { 0%{opacity:0;transform:translate(-50%,-50%) scale(0.5)} 100%{opacity:1;transform:translate(-50%,-50%) scale(1)} }
+        @keyframes bigToastOut { 0%{opacity:1;transform:translate(-50%,-50%) scale(1)}   100%{opacity:0;transform:translate(-50%,-50%) scale(0.8)} }
+
+        @keyframes hazirPulse {
+            0%,100% { transform:scale(1); box-shadow:0 10px 25px -5px rgba(249,115,22,0.4); }
+            50%      { transform:scale(1.06); box-shadow:0 20px 35px -5px rgba(249,115,22,0.7); }
+        }
+        .hazir-pulse { animation: hazirPulse 1.2s ease-in-out infinite; }
+
+        @keyframes cardBlink {
+            0%,100% { box-shadow:0 4px 6px -1px rgba(0,0,0,0.1), 0 0 0 0 rgba(59,130,246,0); }
+            50%      { box-shadow:0 8px 18px -2px rgba(0,0,0,0.15), 0 0 0 6px rgba(59,130,246,0.25); }
+        }
+        .card-blink-bar  { animation: cardBlink 1.6s ease-in-out infinite; }
+        @keyframes cardBlinkOrange {
+            0%,100% { box-shadow:0 4px 6px -1px rgba(0,0,0,0.1), 0 0 0 0 rgba(249,115,22,0); }
+            50%      { box-shadow:0 8px 18px -2px rgba(0,0,0,0.15), 0 0 0 6px rgba(249,115,22,0.30); }
+        }
+        .card-blink-kasa { animation: cardBlinkOrange 1.6s ease-in-out infinite; }
+
+        .product-card { position:relative; overflow:hidden; transition:all 0.3s ease; min-height:128px; display:flex; align-items:center; justify-content:center; }
+        .product-card:hover { transform:translateY(-2px); box-shadow:0 10px 15px -3px rgba(0,0,0,0.1); }
+        .product-card:active { transform:scale(0.98); }
+        .table-select-btn { transition:all 0.3s ease; }
+        .table-select-btn:hover { transform:scale(1.05); }
+        .table-select-btn:active { transform:scale(0.98); }
+
+        .admin-table-container { overflow-x:auto; border-radius:16px; border:1px solid #e5e7eb; margin-bottom:20px; }
+        .admin-table-container table { min-width:800px; width:100%; border-collapse:collapse; }
+        .admin-table-container th, .admin-table-container td { white-space:nowrap; padding:16px 20px; text-align:left; border-bottom:1px solid #f3f4f6; }
+        .admin-table-container th { background:#f9fafb; font-weight:700; color:#4b5563; font-size:14px; text-transform:uppercase; }
+        .admin-table-container tr:hover { background:#f9fafb; }
+        .admin-action-buttons { display:flex; gap:8px; justify-content:flex-end; }
+        .admin-action-btn { width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center; transition:all 0.2s ease; cursor:pointer; }
+        .admin-edit-btn   { background:#fef3c7; color:#d97706; border:1px solid #fde68a; }
+        .admin-edit-btn:hover   { background:#fde68a; transform:scale(1.05); }
+        .admin-delete-btn { background:#fee2e2; color:#dc2626; border:1px solid #fecaca; }
+        .admin-delete-btn:hover { background:#fecaca; transform:scale(1.05); }
+
+        .loading-spinner { width:50px; height:50px; border:4px solid #e2e8f0; border-top:4px solid #4361ee; border-radius:50%; animation:spin 1s linear infinite; }
+        @keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+
+        #productGrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:16px; }
+        @media(max-width:640px) { #productGrid { grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px; } }
+        ::-webkit-scrollbar { width:6px; height:6px; }
+        ::-webkit-scrollbar-track { background:#f1f5f9; border-radius:4px; }
+        ::-webkit-scrollbar-thumb { background:#cbd5e1; border-radius:4px; }
+        ::-webkit-scrollbar-thumb:hover { background:#94a3b8; }
+
+        /* Realtime indicator */
+        .rt-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#10b981; animation:rtPulse 1.5s ease-in-out infinite; }
+        @keyframes rtPulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.4;transform:scale(0.7)} }
+    </style>
+</head>
+
+<body class="bg-gray-50 antialiased text-gray-800">
+
+    <!-- Giriş Paneli -->
+    <div id="loginPanel" class="flex items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+        <div class="w-full max-w-md p-8 space-y-8 bg-white rounded-3xl shadow-2xl border border-gray-100">
+            <div class="text-center mb-4">
+                <div class="bg-gradient-to-br from-blue-500 to-purple-600 w-24 h-24 rounded-full flex items-center justify-center mx-auto mb-6 text-white shadow-lg">
+                    <i class="fas fa-utensils fa-3x"></i>
+                </div>
+                <h2 class="text-4xl font-extrabold text-gray-800 tracking-tight">Hoş Geldiniz</h2>
+                <p class="text-base text-gray-500 mt-2">Profesyonel Sipariş Yönetim Sistemi</p>
+            </div>
+            <form id="loginForm" class="space-y-6">
+                <div>
+                    <label class="text-base font-bold text-gray-700 ml-1">Kullanıcı ID</label>
+                    <div class="relative mt-2">
+                        <span class="absolute inset-y-0 left-0 flex items-center pl-4 text-gray-400"><i class="fas fa-user text-lg"></i></span>
+                        <input id="userId" type="text" autocomplete="username"
+                            class="w-full pl-12 pr-4 py-4 text-lg text-gray-800 bg-gray-50 border-2 border-gray-200 rounded-2xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all"
+                            placeholder="Kullanıcı ID" required>
+                    </div>
+                </div>
+                <div>
+                    <label class="text-base font-bold text-gray-700 ml-1">Şifre</label>
+                    <div class="relative mt-2">
+                        <span class="absolute inset-y-0 left-0 flex items-center pl-4 text-gray-400"><i class="fas fa-lock text-lg"></i></span>
+                        <input id="password" type="password" autocomplete="current-password"
+                            class="w-full pl-12 pr-4 py-4 text-lg text-gray-800 bg-gray-50 border-2 border-gray-200 rounded-2xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 transition-all"
+                            placeholder="••••••" required>
+                    </div>
+                </div>
+                <div class="pt-2">
+                    <button type="submit" id="loginBtn"
+                        class="w-full px-4 py-4 text-lg font-bold text-white bg-gradient-to-r from-blue-600 to-blue-700 rounded-2xl hover:from-blue-700 hover:to-blue-800 transition-all shadow-lg active:scale-[0.98]">
+                        <span id="loginBtnText">Giriş Yap</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Ana Uygulama -->
+    <div id="mainContent" style="display:none;" class="min-h-screen">
+        <!-- Desktop Sidebar -->
+        <div id="desktopSidebar" class="hidden lg:flex flex-col w-64 bg-white shadow-xl border-r border-gray-100 h-screen fixed left-0 top-0">
+            <div class="p-6 border-b border-gray-100">
+                <div class="flex items-center gap-3">
+                    <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
+                        <i class="fas fa-utensils text-white text-xl"></i>
+                    </div>
+                    <div>
+                        <h1 class="font-bold text-lg text-gray-800">Sipariş Sistemi</h1>
+                        <p class="text-xs text-gray-500 flex items-center gap-1"><span class="rt-dot"></span> Canlı</p>
+                    </div>
+                </div>
+            </div>
+            <div id="sidebarUserInfo" class="p-5 border-b border-gray-100"></div>
+            <div id="sidebarMenu" class="flex-1 p-4 space-y-1"></div>
+            <div class="p-4 border-t border-gray-100">
+                <button id="sidebarLogoutBtn" class="flex items-center gap-3 w-full p-3 text-gray-600 hover:text-red-600 hover:bg-red-50 rounded-xl transition-colors">
+                    <i class="fas fa-sign-out-alt"></i><span>Çıkış Yap</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Ana İçerik -->
+        <div class="lg:ml-64">
+            <!-- Mobil Header -->
+            <header id="mobileHeader" class="lg:hidden bg-white shadow-sm border-b border-gray-100 p-4 sticky top-0 z-30">
+                <div class="flex justify-between items-center">
+                    <button id="mobileMenuToggle" class="p-2 text-gray-600"><i class="fas fa-bars fa-lg"></i></button>
+                    <div id="mobileHeaderContent" class="flex-1 text-center"></div>
+                    <button id="mobileLogoutBtn" class="p-2 text-gray-400 hover:text-red-500"><i class="fas fa-sign-out-alt fa-lg"></i></button>
+                </div>
+            </header>
+
+            <!-- Mobil Overlay -->
+            <div id="mobileSidebarOverlay" class="lg:hidden fixed inset-0 bg-black bg-opacity-50 z-40 hidden"></div>
+
+            <!-- Mobil Sidebar -->
+            <div id="mobileSidebar" class="lg:hidden fixed left-0 top-0 h-full w-64 bg-white shadow-xl z-50 transform -translate-x-full transition-transform">
+                <div class="p-6 border-b border-gray-100">
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-3">
+                            <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center">
+                                <i class="fas fa-utensils text-white"></i>
+                            </div>
+                            <div><h1 class="font-bold text-gray-800">Sipariş Sistemi</h1><p class="text-xs text-gray-500">v3.0 Firebase</p></div>
+                        </div>
+                        <button id="closeMobileMenu" class="p-2 text-gray-400"><i class="fas fa-times fa-lg"></i></button>
+                    </div>
+                </div>
+                <div id="mobileUserInfo" class="p-5 border-b border-gray-100"></div>
+                <div id="mobileMenu" class="p-4 space-y-1"></div>
+            </div>
+
+            <main class="p-4 lg:p-6">
+                <div id="tabContainer" style="display:none;">
+                    <nav id="tabButtonsNav" class="my-4 sticky top-20 z-20 bg-white/80 backdrop-blur-sm py-2 rounded-xl"></nav>
+                    <main>
+                        <div id="siparis-girisi" class="tab-content space-y-6 animate-fade-in-up"></div>
+                        <div id="masa-gecmisi" class="tab-content"></div>
+                        <div id="bar" class="tab-content"></div>
+                        <div id="kasa" class="tab-content"></div>
+                        <div id="organizator" class="tab-content"></div>
+                        <div id="yonetim" class="tab-content"></div>
+                        <div id="masa-secimi" class="tab-content"></div>
+                    </main>
+                </div>
+                <div id="adminDashboard" style="display:none;" class="animate-fade-in-up"></div>
+            </main>
+        </div>
+    </div>
+
+    <!-- Onay Dialog -->
+    <div id="confirmationDialog" style="display:none;" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+        <div class="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-sm text-center border border-gray-100">
+            <div class="mx-auto flex items-center justify-center h-16 w-16 rounded-full bg-red-50 mb-6">
+                <svg class="h-10 w-10 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+            </div>
+            <h3 id="confirmationMessage" class="text-2xl font-bold text-gray-800 mb-3">Emin misiniz?</h3>
+            <p class="text-gray-600 text-base mb-8">Bu işlem geri alınamaz.</p>
+            <div class="flex justify-center gap-4">
+                <button id="cancelBtn" class="flex-1 px-6 py-4 bg-gray-100 text-gray-700 font-bold text-lg rounded-2xl hover:bg-gray-200 transition-colors">İptal</button>
+                <button id="confirmBtn" class="flex-1 px-6 py-4 bg-red-600 text-white font-bold text-lg rounded-2xl hover:bg-red-700 transition-colors shadow-lg">Onayla</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Global Loading -->
+    <div id="globalLoadingOverlay" style="display:none;" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[99999] backdrop-blur-sm">
+        <div class="bg-white p-8 rounded-3xl shadow-2xl flex flex-col items-center gap-4">
+            <div class="loading-spinner"></div>
+            <span id="loadingMessage" class="text-xl font-bold text-gray-700">İşleniyor...</span>
+        </div>
+    </div>
+
+    <!-- Dark Mode Toggle -->
+    <button id="darkModeToggle" class="fixed bottom-6 right-6 w-12 h-12 rounded-full bg-gradient-to-br from-gray-800 to-gray-900 text-white flex items-center justify-center shadow-lg z-40 hover:scale-110 transition-transform">
+        <i class="fas fa-moon"></i>
+    </button>
+
+    <script>
+    // ================================================================
+    // UI ÇALIŞMASI İÇİN DB HAZIR OLANA KADAR BEKLE
+    // ================================================================
+    function waitForDB(fn) {
+        if (window._dbReady) fn();
+        else document.addEventListener('db-ready', fn, { once: true });
+    }
+
+    // ================================================================
+    // GLOBAL STATE
+    // ================================================================
+    let currentUser   = null;
+    let selectedTable = null;
+    let activeTab     = null;
+    let orderList     = [];
+    let allProducts   = [];
+    let confirmationResolver = null;
+    let lastSeenHazirIds = new Set();
+    let firstHazirCheck  = true;
+
+    // onSnapshot abonelik anahtarları (DB.unsubscribeKey ile temizlenir)
+    const SNAP_KEYS = { bar: 'snap_bar', cashier: 'snap_cashier', organizer: 'snap_organizer', garson: 'snap_garson', tableSel: 'snap_tableSel', tableHist: 'snap_tableHist' };
+
+    let state = {
+        tableHistory: { viewMode: 'selectedTable', expandedDetails: null, fromSidebar: false },
+        cashier:      { expandedOrderId: null },
+        organizer:    { expandedMasaNo: null, activeReportTab: 'ciro' },
+        admin:        { activeTab: 'users', showUserForm: false, editingUserId: null, showProductForm: false, editingProductId: null }
+    };
+
+    const ALL_TABS = [
+        { id: 'siparis-girisi', label: 'Sipariş',  icon: 'fa-plus-circle',   color: 'from-blue-500 to-blue-600' },
+        { id: 'masa-gecmisi',   label: 'Geçmiş',   icon: 'fa-history',       color: 'from-purple-500 to-purple-600' },
+        { id: 'bar',            label: 'Bar',       icon: 'fa-cocktail',      color: 'from-green-500 to-green-600' },
+        { id: 'kasa',           label: 'Kasa',      icon: 'fa-cash-register', color: 'from-yellow-500 to-yellow-600' },
+        { id: 'yonetim',        label: 'Yönetim',   icon: 'fa-cogs',          color: 'from-red-500 to-red-600' },
+        { id: 'organizator',    label: 'Ciro',      icon: 'fa-chart-line',    color: 'from-indigo-500 to-indigo-600' },
+        { id: 'masa-secimi',    label: 'Masalar',   icon: 'fa-table',         color: 'from-pink-500 to-pink-600' },
+    ];
+
+    const ROLE_PERMISSIONS = {
+        'Garson':     ['siparis-girisi', 'masa-gecmisi', 'masa-secimi'],
+        'Barmen':     ['bar'],
+        'Kasacı':     ['kasa'],
+        'Organizatör':['organizator'],
+        'Yönetici':   ['siparis-girisi', 'bar', 'kasa', 'yonetim', 'organizator', 'masa-secimi', 'masa-gecmisi'],
+    };
+
+    // ================================================================
+    // UTILITY
+    // ================================================================
+    function showNotification(message, type = 'info') {
+        const icons = { info:'fa-info-circle', success:'fa-check-circle', error:'fa-exclamation-circle' };
+        const toast = document.createElement('div');
+        toast.className = `big-toast ${type}`;
+        toast.innerHTML = `<i class="fas ${icons[type]} fa-2x text-white/90"></i><span>${message}</span>`;
+        document.body.appendChild(toast);
+        if (navigator.vibrate) navigator.vibrate(type === 'success' ? [50] : type === 'error' ? [100,50,100] : [30]);
+        setTimeout(() => toast.remove(), 3000);
+    }
+
+    function showGlobalLoading(msg = 'İşleniyor...') {
+        document.getElementById('loadingMessage').textContent = msg;
+        document.getElementById('globalLoadingOverlay').style.display = 'flex';
+    }
+    function hideGlobalLoading() {
+        document.getElementById('globalLoadingOverlay').style.display = 'none';
+    }
+
+    function showConfirmation(message) {
+        return new Promise(resolve => {
+            confirmationResolver = resolve;
+            document.getElementById('confirmationMessage').textContent = message;
+            document.getElementById('confirmationDialog').style.display = 'flex';
+        });
+    }
+    function hideConfirmation(result) {
+        document.getElementById('confirmationDialog').style.display = 'none';
+        if (confirmationResolver) { confirmationResolver(result); confirmationResolver = null; }
+    }
+
+    function formatTimeSafe(t) {
+        if (!t) return '-';
+        const s = t.toString();
+        const part = s.includes(' ') ? s.split(' ')[1] : s;
+        if (part && part.includes(':')) return part.slice(0,5);
+        return s;
+    }
+
+    function getOrderDisplayTime(o) {
+        const s = o.durumu || o.status;
+        if (s === 'Ödendi')  return o.odemesaati  || o.barmenssaati || o.siparissaati || '';
+        if (s === 'Kasada' || s === 'Hazır') return o.barmenssaati || o.siparissaati || '';
+        return o.siparissaati || '';
+    }
+
+    function parseTurkishDate(dateStr, fallback) {
+        if (!dateStr) return 0;
+        try {
+            const s = dateStr.toString().trim();
+            let datePart, timePart;
+            if (s.includes(' ')) { [datePart, timePart] = s.split(' '); }
+            else if (s.includes(':')) {
+                timePart = s;
+                if (fallback) { const fb = fallback.toString().trim(); datePart = fb.includes(' ') ? fb.split(' ')[0] : fb; }
+                else { const now = new Date(); datePart = `${String(now.getDate()).padStart(2,'0')}.${String(now.getMonth()+1).padStart(2,'0')}.${now.getFullYear()}`; }
+            } else return 0;
+            if (!datePart || !timePart) return 0;
+            const [d,m,y] = datePart.split('.'); const [h,mi,se] = timePart.split(':');
+            return new Date(y, m-1, d, h, mi, se||0).getTime();
+        } catch { return 0; }
+    }
+
+    function getMasaDisplayState(masano, allOrders) {
+        const masaOrders = (allOrders||[]).filter(o => String(o.masano) === String(masano) && o.durumu !== 'Ödendi');
+        const hasHazir  = masaOrders.some(o => o.durumu === 'Hazır');
+        const hasBarda  = masaOrders.some(o => o.durumu === 'Barda');
+        const hasKasada = masaOrders.some(o => o.durumu === 'Kasada');
+        const kasadaCount = hasKasada ? new Set(masaOrders.filter(o=>o.durumu==='Kasada').map(o=>String(o.siparisid))).size : 0;
+        if (hasHazir)  return { state:'hazir',  label:'SİPARİŞ HAZIR', gradient:'from-orange-500 to-orange-600', pulse:true,  badgeBg:'bg-orange-700' };
+        if (hasBarda)  return { state:'barda',  label:'BARDA',         gradient:'from-green-500 to-green-600',   pulse:false, badgeBg:'bg-green-700' };
+        if (hasKasada) return { state:'kasada', label:`Kasada ${kasadaCount} Hesap`, gradient:'from-yellow-400 to-yellow-500', pulse:false, badgeBg:'bg-yellow-700' };
+        return { state:'bos', label:'', gradient:'from-blue-500 to-blue-600', pulse:false, badgeBg:'bg-blue-700' };
+    }
+
+    // ================================================================
+    // DARK MODE
+    // ================================================================
+    function initializeDarkMode() {
+        if (localStorage.getItem('darkMode') === 'true') {
+            document.body.classList.add('dark-mode');
+            document.querySelector('#darkModeToggle i').className = 'fas fa-sun';
+        }
+    }
+    function toggleDarkMode() {
+        document.body.classList.toggle('dark-mode');
+        const isDark = document.body.classList.contains('dark-mode');
+        localStorage.setItem('darkMode', isDark);
+        document.querySelector('#darkModeToggle i').className = isDark ? 'fas fa-sun' : 'fas fa-moon';
+    }
+
+    // ================================================================
+    // HEADER / SIDEBAR RENDER
+    // ================================================================
+    function renderHeader() {
+        const user = currentUser;
+        const availableTabs = (ROLE_PERMISSIONS[user.rol]||[]).map(id => ALL_TABS.find(t=>t.id===id)).filter(Boolean);
+
+        const userInfoHTML = `
+            <div class="flex items-center gap-3">
+                <div class="relative">
+                    <div class="w-12 h-12 rounded-full bg-gradient-to-br from-blue-400 to-blue-600 flex items-center justify-center text-white font-bold">${user.adsoyad.charAt(0)}</div>
+                    <div class="absolute bottom-0 right-0 w-3 h-3 bg-green-500 rounded-full border-2 border-white"></div>
+                </div>
+                <div>
+                    <h3 class="font-semibold text-gray-800">${user.adsoyad}</h3>
+                    <span class="text-xs px-2 py-1 bg-blue-100 text-blue-700 rounded-full">${user.rol}</span>
+                </div>
+            </div>`;
+
+        const menuHTML = availableTabs.map(tab => `
+            <button data-tab-id="${tab.id}"
+                    class="sidebar-item flex items-center gap-3 w-full p-4 rounded-xl text-left transition-all ${activeTab===tab.id?'bg-blue-50 text-blue-700 border-l-4 border-blue-500':'text-gray-600 hover:bg-gray-50'}">
+                <i class="fas ${tab.icon} w-6 text-center"></i>
+                <span class="font-medium">${tab.label}</span>
+                ${activeTab===tab.id?'<div class="ml-auto w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>':''}
+            </button>`).join('');
+
+        document.getElementById('sidebarUserInfo').innerHTML = userInfoHTML;
+        document.getElementById('sidebarMenu').innerHTML     = menuHTML;
+        document.getElementById('mobileUserInfo').innerHTML  = userInfoHTML;
+        document.getElementById('mobileMenu').innerHTML      = menuHTML;
+
+        // Mobile header middle
+        let mid = '';
+        if (selectedTable && currentUser.rol === 'Garson' && activeTab === 'siparis-girisi') {
+            mid = `<div class="flex items-center gap-3"><button onclick="goToSelectedTableHistory()" class="flex items-center gap-2 px-3 py-1.5 bg-blue-100 text-blue-700 font-bold rounded-xl text-sm"><i class="fas fa-history"></i><span>Geçmiş</span></button><span class="font-bold text-lg">Masa ${selectedTable}</span></div>`;
+        } else if (activeTab) {
+            const tab = ALL_TABS.find(t=>t.id===activeTab);
+            mid = `<span class="font-bold text-lg">${tab?tab.label:''}</span>`;
+        }
+        document.getElementById('mobileHeaderContent').innerHTML = mid;
+
+        document.querySelectorAll('.sidebar-item').forEach(btn => {
+            btn.onclick = () => {
+                if (btn.dataset.tabId === 'masa-gecmisi') {
+                    state.tableHistory.fromSidebar = true;
+                    state.tableHistory.viewMode = currentUser.rol === 'Yönetici' ? 'allWaiters' : 'allWaiter';
+                }
+                activateTab(btn.dataset.tabId);
+                if (window.innerWidth < 1024) closeMobileMenu();
+            };
+        });
+    }
+
+    function goToSelectedTableHistory() {
+        state.tableHistory.viewMode = 'selectedTable';
+        state.tableHistory.fromSidebar = false;
+        activateTab('masa-gecmisi');
+    }
+
+    // ================================================================
+    // TAB ACTIVATION  –  onSnapshot aboneliklerini burada yönet
+    // ================================================================
+    function activateTab(tabId) {
+        if (tabId === 'masa-secimi') selectedTable = null;
+
+        // Önceki tab'ın aboneliklerini temizle
+        DB.unsubscribeAll();
+
+        activeTab = tabId;
+        document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+        document.getElementById('tabContainer').style.display    = 'block';
+        document.getElementById('adminDashboard').style.display = 'none';
+
+        if (tabId) {
+            document.getElementById(tabId).classList.add('active');
+            switch (tabId) {
+                case 'siparis-girisi': state.tableHistory.viewMode = 'selectedTable'; renderOrderEntry(); break;
+                case 'masa-gecmisi':  renderTableHistory(); break;
+                case 'bar':           renderBar(); break;
+                case 'kasa':          renderCashier(); break;
+                case 'yonetim':       state.admin.activeTab='users'; renderAdmin(); break;
+                case 'organizator':   renderOrganizer(); break;
+                case 'masa-secimi':   renderTableSelectionAsTab(); break;
+            }
+        } else {
+            document.getElementById('adminDashboard').style.display = 'block';
+            document.getElementById('tabContainer').style.display    = 'none';
+            renderAdminDashboard();
+        }
+        renderHeader();
+    }
+
+    // ================================================================
+    // LOGIN / LOGOUT
+    // ================================================================
+    async function handleLogin() {
+        const userId = document.getElementById('userId').value.trim();
+        const pass   = document.getElementById('password').value.trim();
+        if (!userId || !pass) return showNotification('Kullanıcı ID ve şifre gereklidir.', 'error');
+
+        const btn  = document.getElementById('loginBtn');
+        const span = document.getElementById('loginBtnText');
+        btn.disabled = true;
+        span.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Giriş Yapılıyor...';
+
+        try {
+            const user = await DB.handleLogin({ userId, pass });
+            currentUser = user;
+            sessionStorage.setItem('currentUser', JSON.stringify(user));
+            showNotification(`Hoşgeldin, ${user.adsoyad}!`, 'success');
+            initializeAppUI();
+        } catch (err) {
+            showNotification(`Giriş başarısız: ${err.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+            span.textContent = 'Giriş Yap';
+        }
+    }
+
+    function handleLogout() {
+        DB.unsubscribeAll();
+        currentUser = null; selectedTable = null; activeTab = null; orderList = [];
+        firstHazirCheck = true; lastSeenHazirIds = new Set();
+        sessionStorage.removeItem('currentUser');
+        document.getElementById('loginPanel').style.display  = 'flex';
+        document.getElementById('mainContent').style.display = 'none';
+    }
+
+    function initializeAppUI() {
+        document.getElementById('loginPanel').style.display  = 'none';
+        document.getElementById('mainContent').style.display = 'block';
+        const user = currentUser;
+        if (user.rol === 'Yönetici')    activateTab(null);
+        else if (user.rol === 'Garson') { activateTab('masa-secimi'); startGarsonHazirListener(); }
+        else                            activateTab(ROLE_PERMISSIONS[user.rol][0]);
+    }
+
+    // ================================================================
+    // GARSON "HAZIR" BİLDİRİM – onSnapshot ile
+    // ================================================================
+    function startGarsonHazirListener() {
+        if (!currentUser || currentUser.rol !== 'Garson') return;
+        DB.subscribeOrders(SNAP_KEYS.garson, (allOrders) => {
+            const myHazir = allOrders.filter(o => o.durumu === 'Hazır' && String(o.garson||'') === String(currentUser.adsoyad));
+            const currentIds = new Set(myHazir.map(o => String(o.siparisid)));
+            if (firstHazirCheck) { lastSeenHazirIds = currentIds; firstHazirCheck = false; return; }
+            const newOnes = [...currentIds].filter(id => !lastSeenHazirIds.has(id));
+            if (newOnes.length > 0) {
+                if (navigator.vibrate) try { navigator.vibrate([300,120,300,120,300]); } catch(e){}
+                const masas = [...new Set(newOnes.map(id=>myHazir.find(o=>String(o.siparisid)===id)).filter(Boolean).map(o=>o.masano))];
+                if (masas.length>0) showNotification(`Sipariş hazır! Masa ${masas.join(', ')}`, 'success');
+                if (activeTab === 'masa-secimi') renderTableSelectionAsTab();
+            }
+            lastSeenHazirIds = currentIds;
+        });
+    }
+
+    // ================================================================
+    // MOBILE MENU
+    // ================================================================
+    function openMobileMenu()  { document.getElementById('mobileSidebar').classList.remove('-translate-x-full'); document.getElementById('mobileSidebarOverlay').classList.remove('hidden'); }
+    function closeMobileMenu() { document.getElementById('mobileSidebar').classList.add('-translate-x-full'); document.getElementById('mobileSidebarOverlay').classList.add('hidden'); }
+
+    // ================================================================
+    // ADMIN DASHBOARD
+    // ================================================================
+    function renderAdminDashboard() {
+        const container = document.getElementById('adminDashboard');
+        const tabsToRender = ALL_TABS.filter(t => ['siparis-girisi','bar','kasa','yonetim','organizator','masa-secimi'].includes(t.id));
+        container.innerHTML = `
+            <div class="mb-10 text-center">
+                <h2 class="text-4xl font-extrabold text-gray-800">Yönetici Paneli</h2>
+                <p class="text-gray-500 mt-2 text-lg">Sistem yönetimi ve raporlama</p>
+            </div>
+            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 sm:gap-6">
+                ${tabsToRender.map(tab=>`
+                <button data-tab-id="${tab.id}" class="dashboard-card group flex flex-col items-center justify-center p-8 bg-white rounded-3xl shadow-lg hover:shadow-xl border border-gray-50 active:scale-95 transition-all">
+                    <div class="p-5 rounded-3xl bg-gradient-to-br ${tab.color} group-hover:scale-110 transition-transform mb-5">
+                        <i class="fas ${tab.icon} text-white text-2xl"></i>
+                    </div>
+                    <span class="font-bold text-gray-700 text-center text-lg group-hover:text-blue-600 transition-colors">${tab.label}</span>
+                </button>`).join('')}
+            </div>`;
+        container.querySelectorAll('button').forEach(btn => btn.onclick = () => activateTab(btn.dataset.tabId));
+    }
+
+    // ================================================================
+    // MASA SEÇİMİ – onSnapshot
+    // ================================================================
+    async function renderTableSelectionAsTab() {
+        const container = document.getElementById('masa-secimi');
+        container.innerHTML = `<div class="text-center py-12"><i class="fas fa-spinner fa-spin fa-3x text-blue-500"></i></div>`;
+        renderHeader();
+
+        let tables = [];
+        try { tables = await DB.getTables(); } catch(e) { container.innerHTML = `<div class="text-center py-12 text-red-500">Hata: ${e.message}</div>`; return; }
+
+        const visibleTables = currentUser.rol === 'Yönetici' ? tables : tables.filter(t=>t.garson===currentUser.adsoyad);
+
+        // Anlık masa kartları için onSnapshot
+        DB.subscribeOrders(SNAP_KEYS.tableSel, (allOrders) => {
+            let gridHTML = visibleTables.length === 0
+                ? `<div class="col-span-full text-center py-16 text-gray-500 bg-gray-50 rounded-2xl text-lg">Size atanmış masa bulunmuyor.</div>`
+                : visibleTables.sort((a,b)=>a.masano-b.masano).map(table => {
+                    const ms = getMasaDisplayState(table.masano, allOrders);
+                    const garsonLabel = ms.label || (table.garson ? table.garson.split(' ')[0] : 'BOŞ');
+                    return `<button data-table="${table.masano}" class="table-select-btn aspect-square flex flex-col items-center justify-center p-4 text-center text-white bg-gradient-to-br ${ms.gradient} rounded-3xl shadow-lg active:scale-95 transition-all relative overflow-hidden ${ms.pulse?'hazir-pulse':''}">
+                        <span class="text-4xl font-extrabold mb-1 z-10">${table.masano}</span>
+                        <span class="text-xs opacity-95 font-bold tracking-wide z-10 uppercase ${ms.badgeBg} bg-opacity-40 px-2 py-0.5 rounded-full mt-1">${garsonLabel}</span>
+                        <div class="absolute inset-0 bg-white opacity-0 hover:opacity-10 transition-opacity"></div>
+                    </button>`;
+                }).join('');
+
+            container.innerHTML = `<div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-4 sm:gap-6 mt-6">${gridHTML}</div>`;
+
+            container.querySelectorAll('.table-select-btn').forEach(btn => {
+                btn.onclick = () => {
+                    selectedTable = btn.dataset.table;
+                    state.tableHistory.viewMode = 'selectedTable';
+                    activateTab('siparis-girisi');
+                };
+            });
+        });
+    }
+
+    // ================================================================
+    // SİPARİŞ GİRİŞİ
+    // ================================================================
+    async function renderOrderEntry() {
+        const container = document.getElementById('siparis-girisi');
+        document.getElementById('tabButtonsNav').style.display = 'none';
+
+        if (!selectedTable) {
+            container.innerHTML = `<div class="text-center p-12 text-gray-500 bg-gray-50 rounded-2xl">
+                <i class="fas fa-table fa-3x mb-3 text-gray-300"></i>
+                <h3 class="text-xl font-bold text-gray-700 mb-2">Lütfen masa seçin</h3>
+                <button onclick="activateTab('masa-secimi')" class="px-6 py-3 bg-blue-600 text-white font-bold rounded-2xl hover:bg-blue-700 transition-colors">
+                    <i class="fas fa-table mr-2"></i>Masaları Görüntüle</button></div>`;
+            return;
+        }
+
+        container.innerHTML = `<div class="text-center p-8"><i class="fas fa-spinner fa-spin fa-3x text-blue-500"></i></div>`;
+
+        // Barda/Hazır bekleyen sipariş var mı?
+        if (currentUser.rol === 'Garson') {
+            try {
+                const allOrders = await DB.getOrders();
+                const pending = allOrders.filter(o => String(o.masano)===String(selectedTable) && (o.durumu==='Barda'||o.durumu==='Hazır'));
+                if (pending.length > 0) {
+                    const itemsAgg = {};
+                    let uniqueIds = new Set();
+                    pending.forEach(o => {
+                        uniqueIds.add(o.siparisid);
+                        const ad = o.urun || ''; if (!ad) return;
+                        const m = Number(o.miktar)||0; const f = Number(o.fiyat)||0;
+                        if (!itemsAgg[ad]) itemsAgg[ad]={miktar:0,fiyat:f};
+                        itemsAgg[ad].miktar += m; if(f>0) itemsAgg[ad].fiyat=f;
+                    });
+                    const items = Object.entries(itemsAgg).map(([ad,v])=>({ad,miktar:v.miktar,fiyat:v.fiyat}));
+                    const total = items.reduce((s,it)=>s+it.miktar*it.fiyat,0);
+                    const hasHazir = pending.some(o=>o.durumu==='Hazır');
+                    const allHazir = pending.every(o=>o.durumu==='Hazır');
+                    const headerColor = hasHazir ? 'from-orange-500 to-orange-600' : 'from-green-500 to-green-600';
+                    const canDeliver = allHazir;
+                    const deliverBtnClass = canDeliver ? 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white shadow-lg active:scale-95' : 'bg-gray-200 text-gray-400 cursor-not-allowed';
+
+                    container.innerHTML = `<div class="max-w-2xl mx-auto"><div class="card overflow-hidden">
+                        <div class="bg-gradient-to-r ${headerColor} text-white p-6 text-center">
+                            <div class="text-sm uppercase tracking-wider opacity-90 mb-1">${allHazir?'SİPARİŞ HAZIR':'BARDA HAZIRLANIYOR'}</div>
+                            <h2 class="text-4xl font-extrabold">Masa ${selectedTable}</h2>
+                        </div>
+                        <div class="p-5">
+                            <div class="bg-amber-50 border border-amber-200 text-amber-900 text-sm p-3 rounded-xl mb-4 flex items-start gap-2">
+                                <i class="fas fa-info-circle mt-0.5 text-amber-600"></i>
+                                <span>Bekleyen sipariş var. Yeni sipariş girebilmek için önce mevcut siparişi teslim edin.</span>
+                            </div>
+                            <table class="w-full text-left mb-4">
+                                <thead><tr class="text-xs uppercase tracking-wider text-gray-400 border-b border-gray-200">
+                                    <th class="pb-2 pr-2">Ürün</th><th class="pb-2 px-2 text-center">Adet</th><th class="pb-2 pl-2 text-right">Tutar</th>
+                                </tr></thead>
+                                <tbody>${items.map(it=>`<tr class="border-b border-gray-100 last:border-0"><td class="py-3 pr-2 text-lg font-bold text-gray-800">${it.ad}</td><td class="py-3 px-2 text-center"><span class="inline-block bg-blue-100 text-blue-800 text-base font-bold px-3 py-1 rounded-lg">${it.miktar}</span></td><td class="py-3 pl-2 text-right text-lg font-bold">${(it.miktar*it.fiyat).toFixed(2)} ₺</td></tr>`).join('')}</tbody>
+                            </table>
+                            <div class="mb-5 flex justify-between items-center bg-gray-900 text-white px-5 py-4 rounded-2xl">
+                                <span class="text-base font-bold uppercase tracking-wide">Genel Toplam</span>
+                                <span class="text-2xl font-extrabold">${total.toFixed(2)} ₺</span>
+                            </div>
+                            <button id="deliverOrderBtn" ${canDeliver?'':'disabled'} class="w-full px-6 py-5 ${deliverBtnClass} font-extrabold text-xl rounded-2xl transition-all">
+                                ${canDeliver?'<i class="fas fa-check-circle mr-2"></i>Sipariş Masaya Verildi':'<i class="fas fa-hourglass-half mr-2"></i>Henüz Hazır Değil'}
+                            </button>
+                            <button id="cancelDeliverBtn" class="w-full mt-3 px-4 py-3 bg-gray-100 text-gray-700 font-bold rounded-2xl hover:bg-gray-200 transition-colors">
+                                <i class="fas fa-arrow-left mr-2"></i>Geri Dön
+                            </button>
+                        </div>
+                    </div></div>`;
+
+                    if (canDeliver) {
+                        document.getElementById('deliverOrderBtn').onclick = async () => {
+                            const btn = document.getElementById('deliverOrderBtn');
+                            btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>İşleniyor...';
+                            try {
+                                const users = await DB.getUsers();
+                                const cashiers = users.filter(u=>u.rol==='Kasacı');
+                                let kasaci = null;
+                                if (cashiers.length > 0) {
+                                    const wl = {}; cashiers.forEach(c=>wl[c.adsoyad]=0);
+                                    allOrders.forEach(o=>{ if(o.durumu==='Kasada'&&o.kasaci&&wl.hasOwnProperty(o.kasaci)) wl[o.kasaci]++; });
+                                    cashiers.sort((a,b)=>wl[a.adsoyad]-wl[b.adsoyad]);
+                                    kasaci = cashiers[0].adsoyad;
+                                }
+                                await DB.handleUpdateStatusMultiple({ ids:[...uniqueIds], newStatus:'Kasada', kasaci });
+                                showNotification('Sipariş masaya verildi, kasaya iletildi.', 'success');
+                                renderOrderEntry();
+                            } catch(e) {
+                                showNotification('Hata: '+(e&&e.message?e.message:e), 'error');
+                                btn.disabled=false; btn.innerHTML='<i class="fas fa-check-circle mr-2"></i>Sipariş Masaya Verildi';
+                            }
+                        };
+                    }
+                    document.getElementById('cancelDeliverBtn').onclick = () => activateTab('masa-secimi');
+                    return;
+                }
+            } catch(e) { console.warn('pending check failed', e); }
+        }
+
+        // Normal sipariş girişi
+        try {
+            const products = await DB.getProducts();
+            allProducts = products;
+            const categories = [...new Set(products.map(p=>p.tur).sort())];
+
+            container.innerHTML = `
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 h-full">
+                <div class="lg:col-span-2 space-y-5 flex flex-col h-full">
+                    <div class="overflow-x-auto pb-2 -mx-2 px-2">
+                        <div id="productCategoryTabs" class="flex gap-3 min-w-max">
+                            ${categories.map(cat=>`<button data-category="${cat}" class="product-category-btn px-6 py-3 text-base font-bold rounded-2xl transition-all border shadow-sm active:scale-95 whitespace-nowrap">${cat}</button>`).join('')}
+                        </div>
+                    </div>
+                    <div class="flex-grow overflow-y-auto min-h-[400px] bg-gray-50 rounded-3xl border border-gray-100 p-3">
+                        <div id="productGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4"></div>
+                    </div>
+                </div>
+                <div class="lg:col-span-1">
+                    <div class="bg-white border border-gray-200 rounded-3xl shadow-xl h-full flex flex-col max-h-[calc(100vh-220px)] lg:max-h-full">
+                        <div class="p-5 border-b border-gray-100 bg-gray-50 rounded-t-3xl">
+                            <h3 class="text-xl font-bold text-gray-800 flex justify-between items-center">
+                                <span>Sepet</span>
+                                <span id="itemCountBadge" class="bg-blue-600 text-white text-sm font-bold px-3 py-1.5 rounded-full shadow-sm">0</span>
+                            </h3>
+                        </div>
+                        <div class="flex-grow overflow-y-auto p-3" id="orderListContainer">
+                            <table class="w-full text-base text-left"><tbody id="orderTableBody"></tbody></table>
+                        </div>
+                        <div class="p-5 bg-gray-50 border-t border-gray-200 rounded-b-3xl space-y-4">
+                            <input id="orderNote" type="text" placeholder="Not ekle..." class="w-full px-5 py-4 bg-white border border-gray-200 rounded-2xl text-base focus:ring-2 focus:ring-blue-500 outline-none">
+                            <div class="flex justify-between items-end px-1">
+                                <span class="text-gray-500 font-bold text-base">Toplam</span>
+                                <div id="totalAmount" class="text-3xl font-black text-gray-800">0 ₺</div>
+                            </div>
+                            <button id="sendToBarBtn" disabled class="w-full py-4 font-bold text-lg text-white bg-green-600 rounded-2xl shadow-lg hover:bg-green-700 disabled:bg-gray-300 disabled:shadow-none transition-all flex justify-center items-center gap-2 active:scale-[0.98]">
+                                <span>Siparişi Gönder</span><i class="fas fa-paper-plane"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+
+            container.querySelectorAll('.product-category-btn').forEach(btn => btn.onclick = () => renderProductGrid(btn.dataset.category));
+            document.getElementById('sendToBarBtn').onclick = sendOrderToBar;
+            if (categories.length > 0) renderProductGrid(categories[0]);
+            renderOrderTable();
+        } catch(err) {
+            container.innerHTML = `<div class="text-center p-8 text-red-500">Hata: ${err.message}</div>`;
+        }
+    }
+
+    function renderProductGrid(category) {
+        document.querySelectorAll('.product-category-btn').forEach(btn => {
+            const isActive = btn.dataset.category === category;
+            btn.className = `product-category-btn px-6 py-3 text-base font-bold rounded-2xl transition-all border shadow-sm active:scale-95 whitespace-nowrap ${isActive?'bg-blue-600 text-white border-blue-600':'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`;
+        });
+        const grid = document.getElementById('productGrid');
+        const filtered = allProducts.filter(p=>p.tur===category);
+        if (filtered.length === 0) { grid.innerHTML = `<p class="col-span-full text-center text-gray-400 py-16 italic">Bu kategoride ürün bulunmuyor.</p>`; return; }
+        grid.innerHTML = filtered.map(p=>`
+            <div onclick='addProductToOrder("${p.ad.replace(/'/g,"\\'")}", ${p.fiyat})'
+                 class="product-card bg-white border border-gray-200 rounded-2xl shadow-sm hover:shadow-md hover:border-blue-400 cursor-pointer overflow-hidden h-32 flex items-center justify-center transition-all duration-200 active:scale-95">
+                <div class="p-4 text-center w-full">
+                    <h3 class="font-bold text-gray-800 text-base mb-2 truncate px-2">${p.ad}</h3>
+                    <span class="text-blue-600 font-bold text-lg">${parseFloat(p.fiyat).toFixed(2)} ₺</span>
+                </div>
+            </div>`).join('');
+    }
+
+    function addProductToOrder(name, price) {
+        const existing = orderList.find(item=>item.urun===name);
+        if (existing) existing.miktar++;
+        else orderList.push({urun:name, miktar:1, fiyat:price});
+        if (navigator.vibrate) navigator.vibrate(10);
+        renderOrderTable(true);
+    }
+
+    function removeOrderItem(name) {
+        orderList = orderList.filter(item=>item.urun!==name);
+        renderOrderTable(false);
+    }
+
+    function renderOrderTable(scrollToBottom = false) {
+        const tbody = document.getElementById('orderTableBody'); if (!tbody) return;
+        const totalEl    = document.getElementById('totalAmount');
+        const countBadge = document.getElementById('itemCountBadge');
+        if (orderList.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-gray-400 py-16"><i class="fas fa-shopping-basket text-5xl mb-4 opacity-20 block mx-auto"></i><span class="text-lg">Sepet boş</span></td></tr>`;
+            if(countBadge) countBadge.textContent='0';
+        } else {
+            tbody.innerHTML = orderList.map(item=>`
+                <tr class="border-b border-gray-50 last:border-0 group hover:bg-gray-50">
+                    <td class="py-4 pl-2 w-full"><div class="font-bold text-gray-800 text-base">${item.urun}</div><div class="text-sm text-gray-400">${item.fiyat} ₺</div></td>
+                    <td class="py-4 px-2 text-center"><span class="bg-blue-100 text-blue-700 text-sm font-bold px-3 py-1.5 rounded-lg">x${item.miktar}</span></td>
+                    <td class="py-4 px-2 text-right font-bold text-gray-700 text-lg">${(item.miktar*item.fiyat).toFixed(0)} ₺</td>
+                    <td class="py-4 pr-2 text-right"><button onclick="removeOrderItem('${item.urun.replace(/'/g,"\\'")}')" class="w-10 h-10 flex items-center justify-center rounded-full text-red-400 hover:text-red-600 hover:bg-red-50"><i class="fas fa-trash-alt text-lg"></i></button></td>
+                </tr>`).join('');
+            if(countBadge) countBadge.textContent = orderList.reduce((a,i)=>a+i.miktar,0);
+        }
+        const total = orderList.reduce((s,i)=>s+(i.miktar*i.fiyat),0);
+        if(totalEl) totalEl.textContent = `${total.toFixed(0)} ₺`;
+        const sendBtn = document.getElementById('sendToBarBtn');
+        if(sendBtn) sendBtn.disabled = orderList.length===0||!selectedTable;
+        if (scrollToBottom) { const c=document.getElementById('orderListContainer'); if(c) c.scrollTop=c.scrollHeight; }
+    }
+
+    async function sendOrderToBar() {
+        if (!selectedTable || orderList.length===0) return showNotification('Masa seçili ve sepet dolu olmalıdır.','error');
+        showGlobalLoading('Sipariş gönderiliyor...');
+        const btn = document.getElementById('sendToBarBtn');
+        btn.disabled=true; btn.innerHTML='<i class="fas fa-spinner fa-spin text-xl"></i> Gönderiliyor';
+        try {
+            const [users, allOrders] = await Promise.all([DB.getUsers(), DB.getOrders()]);
+            const barmenList = users.filter(u=>u.rol==='Barmen').map(u=>u.adsoyad);
+            let selectedBarmen = 'Barmen';
+            if (barmenList.length > 0) {
+                const wl={}; barmenList.forEach(b=>wl[b]=0);
+                allOrders.forEach(o=>{ if(o.durumu==='Barda'&&o.barmen&&wl.hasOwnProperty(o.barmen)) wl[o.barmen]++; });
+                selectedBarmen = barmenList.sort((a,b)=>wl[a]-wl[b])[0];
+            }
+            await DB.handleSaveOrder({
+                masaNo: selectedTable, garson: currentUser.adsoyad,
+                urunler: orderList, barmen: selectedBarmen,
+                not: document.getElementById('orderNote').value,
+            });
+            showNotification(`Sipariş oluşturuldu. (${selectedBarmen})`, 'success');
+            orderList=[]; document.getElementById('orderNote').value='';
+            renderOrderTable(false);
+            activateTab('masa-secimi');
+        } catch(err) {
+            showNotification(`Hata: ${err.message}`, 'error');
+        } finally {
+            hideGlobalLoading();
+            btn.disabled=false; btn.innerHTML='<span>Siparişi Gönder</span><i class="fas fa-paper-plane"></i>';
+        }
+    }
+
+    // ================================================================
+    // BAR – onSnapshot
+    // ================================================================
+    function renderBar() {
+        const container = document.getElementById('bar');
+        container.innerHTML = `<div class="text-center p-12"><i class="fas fa-spinner fa-spin fa-3x text-gray-400"></i></div>`;
+
+        DB.subscribeOrders(SNAP_KEYS.bar, (allOrders) => {
+            const filtered = allOrders.filter(o=>o.durumu==='Barda'&&(currentUser.rol==='Yönetici'||o.barmen===currentUser.adsoyad));
+            if (filtered.length===0) { container.innerHTML=`<div class="text-center p-12 text-gray-500 bg-gray-50 rounded-2xl"><i class="fas fa-glass-martini-alt fa-3x mb-3 text-gray-300"></i><br>Hazırlanacak sipariş yok.</div>`; return; }
+
+            const ordersById={};
+            filtered.forEach(o=>{
+                if(!ordersById[o.siparisid]) ordersById[o.siparisid]={siparisId:o.siparisid,masaNo:o.masano,garson:o.garson,items:{},notlar:[],siparissaati:o.siparissaati||''};
+                const g=ordersById[o.siparisid];
+                if(!g.items[o.urun]) g.items[o.urun]=0; g.items[o.urun]+=o.miktar;
+                if(o.not&&!g.notlar.includes(o.not)) g.notlar.push(o.not);
+            });
+            const orders = Object.values(ordersById).sort((a,b)=>String(a.siparisId).localeCompare(String(b.siparisId)));
+
+            container.innerHTML = `
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-3xl font-bold text-gray-800 flex items-center gap-2"><i class="fas fa-cocktail text-blue-500"></i> Bar Siparişleri <span class="rt-dot ml-2"></span></h2>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 items-start">
+                ${orders.map(order=>`
+                <div class="card border border-blue-200 overflow-hidden card-blink-bar">
+                    <div class="bg-gradient-to-r from-blue-500 to-blue-600 text-white p-5">
+                        <h3 class="text-2xl font-bold flex items-center gap-2"><div class="w-3 h-3 bg-white rounded-full animate-pulse"></div> Masa ${order.masaNo}</h3>
+                        <div class="text-right text-sm mt-2">
+                            <div class="opacity-90 font-medium">${order.garson}</div>
+                            <div class="text-xs opacity-75 mt-0.5"><i class="far fa-clock mr-1"></i>${formatTimeSafe(order.siparissaati)}</div>
+                        </div>
+                    </div>
+                    <div class="p-5">
+                        <ul class="space-y-3 mb-6">
+                            ${Object.entries(order.items).sort((a,b)=>a[0].localeCompare(b[0])).map(([name,qty])=>`
+                            <li class="flex justify-between items-center border-b border-gray-50 pb-2 last:border-0">
+                                <span class="font-bold text-gray-800 text-xl">${name}</span>
+                                <span class="bg-blue-100 text-blue-800 text-lg font-bold px-3 py-1 rounded-lg">${qty}</span>
+                            </li>`).join('')}
+                        </ul>
+                        ${order.notlar.length>0?`<div class="bg-yellow-50 text-yellow-800 text-base p-4 rounded-2xl mb-5 border border-yellow-100 flex items-start gap-2"><i class="fas fa-sticky-note mt-1"></i><span>${order.notlar.join(', ')}</span></div>`:''}
+                        <div class="flex gap-3">
+                            ${['Barmen','Yönetici'].includes(currentUser.rol)?`<button onclick="deleteOrderBar('${order.siparisId}','${order.masaNo}')" class="flex-1 px-4 py-3 bg-red-50 text-red-600 font-bold rounded-xl hover:bg-red-100"><i class="fas fa-trash mr-2"></i>Sil</button>`:''}
+                            <button onclick="updateOrderStatus('${order.siparisId}','Hazır','${order.masaNo}')" class="flex-1 px-4 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white font-bold rounded-xl hover:from-orange-600 hover:to-orange-700">
+                                <i class="fas fa-hand-holding mr-2"></i>Garsona Ver
+                            </button>
+                        </div>
+                    </div>
+                </div>`).join('')}
+            </div>`;
+        });
+    }
+
+    window.deleteOrderBar = async (id, masaNo) => {
+        if (await showConfirmation(`Masa ${masaNo} siparişi silinsin mi?`)) {
+            try { await DB.handleDeleteOrder({siparisId:id}); showNotification('Sipariş silindi','success'); }
+            catch(e) { showNotification(e.message,'error'); }
+        }
+    };
+
+    window.updateOrderStatus = async (id, status, masaNo) => {
+        showGlobalLoading('Durum güncelleniyor...');
+        try {
+            let kasaci = null;
+            if (status === 'Kasada') {
+                const users = await DB.getUsers();
+                const cashiers = users.filter(u=>u.rol==='Kasacı');
+                if (cashiers.length > 0) {
+                    const allOrders = await DB.getOrders();
+                    const wl={}; cashiers.forEach(c=>wl[c.adsoyad]=0);
+                    allOrders.forEach(o=>{ if(o.durumu==='Kasada'&&o.kasaci&&wl.hasOwnProperty(o.kasaci)) wl[o.kasaci]++; });
+                    cashiers.sort((a,b)=>wl[a.adsoyad]-wl[b.adsoyad]);
+                    kasaci = cashiers[0].adsoyad;
+                }
+            }
+            await DB.handleUpdateStatusMultiple({ids:[id], newStatus:status, kasaci});
+            showNotification(`Masa ${masaNo} güncellendi: ${status}`, 'success');
+        } catch(err) { showNotification(err.message,'error'); }
+        finally { hideGlobalLoading(); }
+    };
+
+    // ================================================================
+    // KASA – onSnapshot
+    // ================================================================
+    function renderCashier() {
+        const container = document.getElementById('kasa');
+        container.innerHTML = `<div class="text-center p-12"><i class="fas fa-spinner fa-spin fa-3x text-gray-400"></i></div>`;
+
+        DB.subscribeOrders(SNAP_KEYS.cashier, (allOrders) => {
+            const { expandedOrderId } = state.cashier;
+            const filtered = allOrders.filter(o=>o.durumu==='Kasada'&&(currentUser.rol==='Yönetici'||!o.kasaci||o.kasaci===currentUser.adsoyad));
+            if (filtered.length===0) { container.innerHTML=`<div class="text-center p-12 text-gray-500 bg-gray-50 rounded-2xl"><i class="fas fa-cash-register fa-3x mb-3 text-gray-300"></i><br>Ödeme bekleyen masa yok.</div>`; return; }
+
+            const ordersById={};
+            filtered.forEach(o=>{
+                if(!ordersById[o.siparisid]) ordersById[o.siparisid]={siparisId:o.siparisid,masaNo:o.masano,garson:o.garson,barmen:o.barmen,siparissaati:o.siparissaati||'',gonderimSaati:o.barmenssaati||o.odemesaati||'',tarih:o.tarih,total:0,items:{}};
+                const g=ordersById[o.siparisid]; g.total+=o.miktar*o.fiyat; g.items[o.urun]=(g.items[o.urun]||0)+o.miktar;
+            });
+            const orders = Object.values(ordersById).sort((a,b)=>{
+                const ta=parseTurkishDate(a.gonderimSaati,a.tarih), tb=parseTurkishDate(b.gonderimSaati,b.tarih);
+                return ta===tb ? String(a.siparisId).localeCompare(String(b.siparisId)) : ta-tb;
+            });
+
+            container.innerHTML = `
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-3xl font-bold text-gray-800 flex items-center gap-2"><i class="fas fa-lira-sign text-green-600"></i> Kasa İşlemleri <span class="rt-dot ml-2"></span></h2>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5 items-start">
+                ${orders.map(order=>`
+                <div class="card overflow-hidden card-blink-kasa">
+                    <div class="p-6 cursor-pointer bg-gray-50 hover:bg-gray-100 transition-colors" onclick="toggleCashierDetails('${order.siparisId}')">
+                        <div class="flex justify-between items-start gap-4">
+                            <div class="flex-1 min-w-0">
+                                <h3 class="text-2xl font-bold text-gray-800 mb-2">Masa ${order.masaNo}</h3>
+                                <div class="text-sm text-gray-700 font-medium">${order.garson||'-'}</div>
+                                <div class="text-xs text-gray-500 mt-1"><i class="far fa-clock mr-1"></i>${formatTimeSafe(order.siparissaati)}</div>
+                            </div>
+                            <div class="text-right flex flex-col items-end gap-3">
+                                <div class="font-black text-green-600 text-3xl">${order.total.toFixed(0)} ₺</div>
+                                <button onclick="event.stopPropagation();updateOrderStatus('${order.siparisId}','Ödendi','${order.masaNo}')" class="px-5 py-2.5 bg-green-600 text-white font-bold rounded-xl hover:bg-green-700 shadow-md text-sm">Ödemeyi Al</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="accordion-content ${expandedOrderId===order.siparisId?'expanded':''}" id="cashier-details-${order.siparisId}">
+                        <div class="p-6 border-t border-gray-100 bg-white">
+                            <ul class="space-y-3 text-base text-gray-600">
+                                ${Object.entries(order.items).map(([name,qty])=>`<li class="flex justify-between items-center"><span class="font-medium">${name}</span><span class="bg-gray-100 text-gray-800 px-3 py-1 rounded-lg text-sm font-bold">x${qty}</span></li>`).join('')}
+                            </ul>
+                        </div>
+                    </div>
+                </div>`).join('')}
+            </div>`;
+        });
+    }
+
+    window.toggleCashierDetails = (id) => {
+        const content = document.getElementById(`cashier-details-${id}`);
+        if (state.cashier.expandedOrderId && state.cashier.expandedOrderId!==id) {
+            const prev=document.getElementById(`cashier-details-${state.cashier.expandedOrderId}`); if(prev) prev.classList.remove('expanded');
+        }
+        state.cashier.expandedOrderId = state.cashier.expandedOrderId===id ? null : id;
+        if(content) content.classList.toggle('expanded', state.cashier.expandedOrderId===id);
+    };
+
+    // ================================================================
+    // MASA GEÇMİŞİ – onSnapshot
+    // ================================================================
+    function renderTableHistory() {
+        const container = document.getElementById('masa-gecmisi');
+        document.getElementById('tabButtonsNav').style.display='none';
+        const { viewMode, expandedDetails } = state.tableHistory;
+
+        const getStatusClass = s => s==='Ödendi'?'bg-gray-50 opacity-70':s==='Kasada'?'bg-purple-50 border-l-4 border-purple-500':s==='Barda'?'bg-yellow-50 border-l-4 border-yellow-500':'bg-white';
+        const getStatusOrder = s => s==='Barda'?1:s==='Kasada'?2:s==='Ödendi'?3:4;
+
+        container.innerHTML = `<div class="text-center p-12"><i class="fas fa-spinner fa-spin fa-3x text-gray-400"></i></div>`;
+
+        DB.subscribeOrders(SNAP_KEYS.tableHist, (allOrders) => {
+            let filtered=[], title='';
+            switch (viewMode) {
+                case 'selectedTable': filtered=allOrders.filter(o=>String(o.masano)===String(selectedTable)); title=`Masa ${selectedTable} Geçmişi`; break;
+                case 'allWaiter':     filtered=allOrders.filter(o=>o.garson===currentUser.adsoyad); title='Tüm Siparişlerim'; break;
+                case 'allWaiters':    filtered=allOrders; title='Tüm Siparişler'; break;
+                default:              filtered=allOrders.filter(o=>String(o.masano)===String(selectedTable)); title=`Masa ${selectedTable||'?'} Geçmişi`;
+            }
+
+            const ordersById={};
+            filtered.forEach(o=>{
+                if(!ordersById[o.siparisid]) ordersById[o.siparisid]={siparisId:o.siparisid,items:[],total:0,status:o.durumu,masaNo:o.masano,odemesaati:o.odemesaati||'',siparissaati:o.siparissaati||'',barmenssaati:o.barmenssaati||'',tarih:o.tarih,garson:o.garson};
+                ordersById[o.siparisid].items.push({urun:o.urun,miktar:o.miktar,fiyat:o.fiyat});
+                ordersById[o.siparisid].total+=o.fiyat*o.miktar;
+            });
+
+            const sorted = Object.values(ordersById).sort((a,b)=>{
+                const so=getStatusOrder(a.status)-getStatusOrder(b.status); if(so!==0) return so;
+                return parseTurkishDate(getOrderDisplayTime(a),a.tarih)-parseTurkishDate(getOrderDisplayTime(b),b.tarih);
+            });
+
+            if (sorted.length===0) {
+                container.innerHTML=`<div class="flex justify-between items-center mb-6"><h2 class="text-2xl font-bold text-gray-800"><i class="fas fa-clock text-blue-500 mr-2"></i>${title}</h2></div><div class="text-center p-12 text-gray-500 bg-gray-50 rounded-2xl"><i class="fas fa-history fa-3x mb-3 text-gray-300"></i><br>Gösterilecek sipariş bulunamadı.</div>`;
+                return;
+            }
+
+            container.innerHTML = `
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-2xl font-bold text-gray-800 flex items-center gap-2"><i class="fas fa-clock text-blue-500"></i>${title} <span class="rt-dot ml-1"></span></h2>
+            </div>
+            <div class="space-y-4">
+                ${sorted.map(order=>`
+                <div class="rounded-2xl shadow-sm border border-gray-100 overflow-hidden ${getStatusClass(order.status)} transition-all">
+                    <div class="p-5 flex justify-between items-center cursor-pointer" onclick="toggleHistoryDetails('${order.siparisId}')">
+                        <div class="flex items-center gap-4">
+                            <div class="w-12 h-12 rounded-full bg-white bg-opacity-70 flex items-center justify-center shadow-sm"><i class="fas fa-receipt text-xl text-gray-600"></i></div>
+                            <div>
+                                <div class="font-bold text-lg text-gray-800">${viewMode==='allWaiter'||viewMode==='allWaiters'?`Masa ${order.masaNo}`:`Sipariş #${order.siparisId.slice(-4)}`}</div>
+                                <div class="text-sm font-medium opacity-60 mt-1">${formatTimeSafe(getOrderDisplayTime(order))} • ${order.status}</div>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-4">
+                            <div class="font-extrabold text-xl text-gray-800">${order.total.toFixed(0)} ₺</div>
+                            <i class="fas fa-chevron-down text-gray-400 text-lg transition-transform ${expandedDetails===order.siparisId?'rotate-180':''}"></i>
+                        </div>
+                    </div>
+                    <div id="history-details-${order.siparisId}" class="accordion-content bg-white border-t border-gray-50 ${expandedDetails===order.siparisId?'expanded':''}">
+                        <div class="p-5">
+                            <table class="w-full text-base mb-4">
+                                <thead class="text-sm text-gray-400 uppercase bg-gray-50 rounded-lg">
+                                    <tr><th class="px-3 py-2 text-left">Ürün</th><th class="px-3 py-2 text-center">Adet</th><th class="px-3 py-2 text-right">Tutar</th></tr>
+                                </thead>
+                                <tbody>
+                                    ${order.items.map(item=>`<tr class="border-b border-gray-50 last:border-0"><td class="px-3 py-3 font-medium text-gray-700">${item.urun}</td><td class="px-3 py-3 text-center text-gray-500">${item.miktar}</td><td class="px-3 py-3 text-right font-bold text-gray-700">${(item.fiyat*item.miktar).toFixed(0)} ₺</td></tr>`).join('')}
+                                </tbody>
+                                <tfoot class="bg-gray-50"><tr><td colspan="2" class="px-3 py-3 text-right font-bold">Toplam:</td><td class="px-3 py-3 text-right font-extrabold text-xl text-gray-800">${order.total.toFixed(0)} ₺</td></tr></tfoot>
+                            </table>
+                            ${currentUser.rol==='Yönetici'&&order.status!=='Ödendi'?`<div class="text-right border-t border-gray-100 pt-3"><button onclick="deleteOrderHistory('${order.siparisId}','${order.masaNo}')" class="px-5 py-2.5 bg-red-50 text-red-600 rounded-xl font-bold text-sm hover:bg-red-100"><i class="fas fa-trash mr-1"></i>Siparişi Sil</button></div>`:''}
+                        </div>
+                    </div>
+                </div>`).join('')}
+            </div>`;
+        });
+    }
+
+    window.toggleHistoryDetails = (id) => {
+        state.tableHistory.expandedDetails = state.tableHistory.expandedDetails===id ? null : id;
+        renderTableHistory();
+    };
+    window.deleteOrderHistory = async (id, masaNo) => {
+        if (await showConfirmation(`Masa ${masaNo} siparişi silinsin mi?`)) {
+            try { await DB.handleDeleteOrder({siparisId:id}); showNotification('Sipariş silindi','success'); }
+            catch(e) { showNotification(e.message,'error'); }
+        }
+    };
+
+    // ================================================================
+    // ORGANİZATÖR – onSnapshot
+    // ================================================================
+    function renderOrganizer() {
+        const container = document.getElementById('organizator');
+        container.innerHTML = `<div class="text-center p-12"><i class="fas fa-spinner fa-spin fa-3x text-gray-400"></i></div>`;
+
+        DB.subscribeOrders(SNAP_KEYS.organizer, (allOrders) => {
+            const { activeReportTab, expandedMasaNo } = state.organizer;
+            const paidOrders = allOrders.filter(o=>o.durumu==='Ödendi');
+            let grandTotal=0;
+            const tables={}, products={}, waiters={};
+
+            paidOrders.forEach(o=>{
+                if(!tables[o.masano]) tables[o.masano]={masaNo:o.masano,totalAmount:0,orders:{},garson:o.garson};
+                const t=tables[o.masano]; t.totalAmount+=o.miktar*o.fiyat; grandTotal+=o.miktar*o.fiyat;
+                if(!t.orders[o.siparisid]) t.orders[o.siparisid]={siparisId:o.siparisid,totalAmount:0,odemesaati:o.odemesaati,items:[],not:o.not,garson:o.garson,kasaci:o.kasaci};
+                const ord=t.orders[o.siparisid]; ord.totalAmount+=o.miktar*o.fiyat; ord.items.push({urun:o.urun,miktar:o.miktar,fiyat:o.fiyat});
+
+                if(!products[o.urun]) products[o.urun]={name:o.urun,count:0,total:0};
+                products[o.urun].count+=o.miktar; products[o.urun].total+=o.miktar*o.fiyat;
+
+                const g=(o.garson&&String(o.garson).trim())||'Belirsiz';
+                if(!waiters[g]) waiters[g]={name:g,total:0,itemCount:0,orderIds:new Set(),tableSet:new Set()};
+                const w=waiters[g]; w.total+=o.miktar*o.fiyat; w.itemCount+=o.miktar;
+                if(o.siparisid) w.orderIds.add(o.siparisid); if(o.masano!==undefined) w.tableSet.add(o.masano);
+            });
+
+            const tableList=Object.values(tables).map(t=>({...t,orders:Object.values(t.orders)})).sort((a,b)=>b.totalAmount-a.totalAmount);
+            const productList=Object.values(products).sort((a,b)=>b.count-a.count);
+            const waiterList=Object.values(waiters).map(w=>({name:w.name,total:w.total,itemCount:w.itemCount,orderCount:w.orderIds.size,tableCount:w.tableSet.size,avgOrder:w.orderIds.size>0?w.total/w.orderIds.size:0})).sort((a,b)=>b.total-a.total);
+
+            const tabsHtml=`<div class="flex border-b border-gray-100 bg-gray-50 p-2 gap-2 mb-4 rounded-xl">
+                <button onclick="switchReportTab('ciro')" class="flex-1 py-3 text-base font-bold text-center rounded-xl ${activeReportTab==='ciro'?'bg-white text-blue-600 shadow-sm':'text-gray-500 hover:bg-gray-200'}">Masa Ciroları</button>
+                <button onclick="switchReportTab('urun')" class="flex-1 py-3 text-base font-bold text-center rounded-xl ${activeReportTab==='urun'?'bg-white text-blue-600 shadow-sm':'text-gray-500 hover:bg-gray-200'}">Ürün Satışları</button>
+                <button onclick="switchReportTab('garson')" class="flex-1 py-3 text-base font-bold text-center rounded-xl ${activeReportTab==='garson'?'bg-white text-blue-600 shadow-sm':'text-gray-500 hover:bg-gray-200'}">Garson Performansı</button>
+            </div>`;
+
+            let contentHtml='';
+            if (activeReportTab==='ciro') {
+                contentHtml=`<div class="flex justify-between items-center mb-6 bg-white p-5 rounded-3xl shadow-sm border border-gray-100">
+                    <h2 class="text-2xl font-bold text-gray-800 flex items-center gap-3"><i class="fas fa-chart-pie text-blue-500"></i>Toplam Ciro</h2>
+                    <div class="bg-green-50 text-green-700 px-5 py-2 rounded-2xl font-black text-xl border border-green-100">${grandTotal.toFixed(0)} ₺</div>
+                </div>
+                <div class="space-y-4">
+                    ${tableList.map(table=>`
+                    <div class="bg-white border border-gray-200 rounded-3xl overflow-hidden">
+                        <div class="flex justify-between items-center p-5 cursor-pointer hover:bg-gray-50" onclick="toggleOrganizerMasa(${table.masaNo})">
+                            <div class="flex items-center gap-4">
+                                <div class="w-12 h-12 rounded-full bg-blue-50 flex items-center justify-center text-blue-600 font-bold">${table.masaNo}</div>
+                                <div><span class="font-bold text-gray-700 text-lg">${table.garson||'Masa '+table.masaNo}</span></div>
+                            </div>
+                            <div class="flex items-center gap-4">
+                                <span class="font-extrabold text-gray-800 text-xl">${table.totalAmount.toFixed(0)} ₺</span>
+                                <i class="fas fa-chevron-down text-gray-400 text-sm transition-transform ${expandedMasaNo===table.masaNo?'rotate-180':''}" id="organizer-icon-${table.masaNo}"></i>
+                            </div>
+                        </div>
+                        <div class="accordion-content bg-gray-50 ${expandedMasaNo===table.masaNo?'expanded':''}" id="organizer-details-${table.masaNo}">
+                            <div class="p-5 space-y-4">
+                                ${table.orders.map(order=>`
+                                <div class="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm">
+                                    <div class="flex justify-between mb-3 pb-3 border-b border-gray-50">
+                                        <div>${order.not?`<span class="font-bold text-gray-700 text-sm italic">"${order.not}"</span>`:'<i class="fas fa-heart text-red-500"></i>'}</div>
+                                        <div class="text-right"><div class="text-gray-400 text-sm">${formatTimeSafe(order.odemesaati)}</div><div class="text-xs text-gray-500">Kasacı: ${order.kasaci||'-'}</div></div>
+                                    </div>
+                                    <div class="space-y-2 mb-3">${order.items.map(item=>`<div class="flex justify-between text-gray-600 text-sm"><span>${item.urun} <span class="text-gray-400">x${item.miktar}</span></span><span class="font-medium">${(item.fiyat*item.miktar).toFixed(0)} ₺</span></div>`).join('')}</div>
+                                    <div class="text-right font-bold text-gray-800 border-t border-dashed pt-2 text-lg">${order.totalAmount.toFixed(0)} ₺</div>
+                                </div>`).join('')}
+                            </div>
+                        </div>
+                    </div>`).join('')}
+                </div>`;
+            } else if (activeReportTab==='urun') {
+                contentHtml=`<div class="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
+                    <table class="w-full text-left">
+                        <thead class="bg-gray-50 text-gray-500 font-bold text-sm uppercase"><tr><th class="px-6 py-4">Ürün</th><th class="px-6 py-4 text-center">Adet</th><th class="px-6 py-4 text-right">Toplam</th></tr></thead>
+                        <tbody class="divide-y divide-gray-100">
+                            ${productList.map(p=>`<tr class="hover:bg-gray-50"><td class="px-6 py-4 font-bold text-gray-800">${p.name}</td><td class="px-6 py-4 text-center"><span class="bg-blue-100 text-blue-800 font-bold px-3 py-1 rounded-lg text-sm">${p.count}</span></td><td class="px-6 py-4 text-right font-bold text-green-600">${p.total.toFixed(0)} ₺</td></tr>`).join('')}
+                        </tbody>
+                    </table>
+                </div>`;
+            } else {
+                const maxTotal=waiterList.length>0?waiterList[0].total:1;
+                const totalAll=waiterList.reduce((s,w)=>s+w.total,0);
+                contentHtml=`<div class="bg-white p-5 rounded-3xl shadow-sm border border-gray-100 mb-4">
+                    <div class="flex justify-between items-center"><h2 class="text-2xl font-bold text-gray-800"><i class="fas fa-user-tie text-indigo-500 mr-2"></i>Garson Performansı</h2><div class="bg-indigo-50 text-indigo-700 px-5 py-2 rounded-2xl font-black text-xl">${totalAll.toFixed(0)} ₺</div></div>
+                </div>
+                <div class="bg-white rounded-3xl shadow-sm border border-gray-100 divide-y divide-gray-100 overflow-hidden">
+                    ${waiterList.map((w,i)=>{
+                        const widthPct=(w.total/maxTotal*100).toFixed(1);
+                        const sharePct=totalAll>0?(w.total/totalAll*100).toFixed(1):'0.0';
+                        const rankClass=i===0?'bg-yellow-100 text-yellow-700':i===1?'bg-gray-200 text-gray-700':i===2?'bg-orange-100 text-orange-700':'bg-blue-50 text-blue-600';
+                        const barClass=i===0?'from-yellow-400 to-yellow-500':i===1?'from-gray-400 to-gray-500':i===2?'from-orange-400 to-orange-500':'from-blue-400 to-blue-500';
+                        return `<div class="p-5">
+                            <div class="flex justify-between items-center mb-3">
+                                <div class="flex items-center gap-3">
+                                    <div class="w-10 h-10 rounded-full ${rankClass} flex items-center justify-center font-bold">${i===0?'<i class="fas fa-crown text-xs"></i>':i+1}</div>
+                                    <div><div class="font-bold text-gray-800 text-lg">${w.name}</div><div class="text-xs text-gray-500">${w.orderCount} sipariş • ${w.tableCount} masa • ${w.itemCount} ürün</div></div>
+                                </div>
+                                <div class="text-right"><div class="font-extrabold text-xl text-green-600">${w.total.toFixed(0)} ₺</div><div class="text-xs text-gray-500">%${sharePct} • Ort: ${w.avgOrder.toFixed(0)} ₺</div></div>
+                            </div>
+                            <div class="w-full bg-gray-100 rounded-full h-3 overflow-hidden"><div class="h-full bg-gradient-to-r ${barClass} rounded-full" style="width:${widthPct}%"></div></div>
+                        </div>`;
+                    }).join('')}
+                </div>`;
+            }
+            container.innerHTML = tabsHtml + contentHtml;
+        });
+    }
+
+    window.switchReportTab = (tab) => { state.organizer.activeReportTab=tab; renderOrganizer(); };
+    window.toggleOrganizerMasa = (masaNo) => {
+        const content=document.getElementById(`organizer-details-${masaNo}`), icon=document.getElementById(`organizer-icon-${masaNo}`);
+        if(state.organizer.expandedMasaNo&&state.organizer.expandedMasaNo!==masaNo){
+            const pc=document.getElementById(`organizer-details-${state.organizer.expandedMasaNo}`),pi=document.getElementById(`organizer-icon-${state.organizer.expandedMasaNo}`);
+            if(pc)pc.classList.remove('expanded'); if(pi)pi.classList.remove('rotate-180');
+        }
+        state.organizer.expandedMasaNo=state.organizer.expandedMasaNo===masaNo?null:masaNo;
+        if(content)content.classList.toggle('expanded',state.organizer.expandedMasaNo===masaNo);
+        if(icon)icon.classList.toggle('rotate-180',state.organizer.expandedMasaNo===masaNo);
+    };
+
+    // ================================================================
+    // YÖNETİM ADMIN PANELİ
+    // ================================================================
+    async function renderAdmin() {
+        const container = document.getElementById('yonetim');
+        container.innerHTML=`<div class="text-center p-12 text-gray-500"><i class="fas fa-circle-notch fa-spin fa-3x"></i></div>`;
+        try {
+            const [users,products,tables] = await Promise.all([DB.getUsers(),DB.getProducts(),DB.getTables()]);
+            const waiters = users.filter(u=>u.rol==='Garson').map(u=>u.adsoyad);
+            container.innerHTML = getAdminPanelHTML({users,products,tables,waiters});
+            attachAdminPanelListeners({users,products,tables,waiters});
+        } catch(err) { container.innerHTML=`<div class="text-center p-8 text-red-500">Hata: ${err.message}</div>`; }
+    }
+
+    function getAdminPanelHTML({users,products,tables,waiters}) {
+        const {activeTab:at,showUserForm,editingUserId,showProductForm,editingProductId}=state.admin;
+
+        const userContent=()=>{
+            if(showUserForm){
+                const u=editingUserId?users.find(u=>u.id==editingUserId):{id:'',adsoyad:'',rol:''};
+                return `<form id="admin-userForm" class="bg-gray-50 p-6 rounded-3xl border border-gray-200 max-w-lg mx-auto">
+                    <h3 class="text-2xl font-bold mb-6 text-gray-800 border-b pb-2">${editingUserId?'Kullanıcı Düzenle':'Yeni Kullanıcı Ekle'}</h3>
+                    <div class="space-y-5">
+                        <div><label class="block text-base font-bold text-gray-700 mb-2">Kullanıcı ID</label><input name="id" type="text" value="${u.id||''}" class="w-full px-5 py-3 border border-gray-300 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none" ${editingUserId?'disabled bg-gray-200':'required'}></div>
+                        <div><label class="block text-base font-bold text-gray-700 mb-2">Ad Soyad</label><input name="adsoyad" type="text" value="${u.adsoyad||''}" class="w-full px-5 py-3 border border-gray-300 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none" required></div>
+                        <div><label class="block text-base font-bold text-gray-700 mb-2">Rol</label><select name="rol" class="w-full px-5 py-3 border border-gray-300 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none bg-white" required>
+                            <option value="" disabled selected>Rol Seçin</option>
+                            ${['Garson','Barmen','Kasacı','Organizatör','Yönetici'].map(r=>`<option value="${r}" ${(u.rol||'')==r?'selected':''}>${r}</option>`).join('')}
+                        </select></div>
+                        <div><label class="block text-base font-bold text-gray-700 mb-2">Şifre</label><input name="sifre" type="password" placeholder="${editingUserId?'Değişmeyecekse boş bırakın':''}" class="w-full px-5 py-3 border border-gray-300 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none" ${!editingUserId?'required':''}></div>
+                    </div>
+                    <div class="flex gap-4 mt-8">
+                        <button type="button" id="admin-cancelUserForm" class="flex-1 py-3.5 bg-gray-200 text-gray-700 font-bold text-lg rounded-2xl hover:bg-gray-300">İptal</button>
+                        <button type="submit" class="flex-1 py-3.5 bg-blue-600 text-white font-bold text-lg rounded-2xl hover:bg-blue-700 shadow-lg">Kaydet</button>
+                    </div>
+                </form>`;
+            }
+            return `<div class="flex justify-between items-center mb-6"><h3 class="font-bold text-gray-700 text-xl">Kullanıcı Listesi</h3><button id="admin-newUserBtn" class="px-5 py-2.5 bg-green-600 text-white text-base font-bold rounded-2xl hover:bg-green-700"><i class="fas fa-plus mr-2"></i>Ekle</button></div>
+            <div class="admin-table-container"><table class="w-full text-base text-left bg-white">
+                <thead class="text-sm uppercase bg-gray-50 text-gray-500"><tr><th>ID</th><th>Ad Soyad</th><th>Rol</th><th class="text-right">İşlem</th></tr></thead>
+                <tbody class="divide-y divide-gray-100">
+                    ${users.map(u=>`<tr class="hover:bg-gray-50"><td class="font-bold text-gray-900">${u.id}</td><td>${u.adsoyad}</td><td><span class="px-3 py-1 bg-blue-100 text-blue-700 rounded-xl text-sm font-bold">${u.rol}</span></td>
+                    <td><div class="admin-action-buttons"><button class="admin-action-btn admin-edit-btn admin-editUserBtn" data-userid="${u.id}"><i class="fas fa-edit"></i></button><button class="admin-action-btn admin-delete-btn admin-deleteUserBtn" data-userid="${u.id}"><i class="fas fa-trash"></i></button></div></td></tr>`).join('')}
+                </tbody>
+            </table></div>`;
+        };
+
+        const productContent=()=>{
+            if(showProductForm){
+                const p=editingProductId?products.find(p=>p.id==editingProductId):{id:'',ad:'',fiyat:'',tur:''};
+                const cats=[...new Set(products.map(x=>x.tur))];
+                return `<form id="admin-productForm" class="bg-gray-50 p-6 rounded-3xl border border-gray-200 max-w-lg mx-auto">
+                    <h3 class="text-2xl font-bold mb-6 text-gray-800 border-b pb-2">${editingProductId?'Ürün Düzenle':'Yeni Ürün Ekle'}</h3>
+                    <div class="space-y-5">
+                        <input type="hidden" name="id" value="${p.id||''}">
+                        <div><label class="block text-base font-bold text-gray-700 mb-2">Ürün Adı <span class="text-red-500">*</span></label><input name="ad" type="text" value="${p.ad||''}" class="w-full px-5 py-3 border border-gray-300 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none" required></div>
+                        <div><label class="block text-base font-bold text-gray-700 mb-2">Fiyat (₺) <span class="text-red-500">*</span></label><input name="fiyat" type="number" step="0.01" value="${p.fiyat||''}" class="w-full px-5 py-3 border border-gray-300 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none" required></div>
+                        <div><label class="block text-base font-bold text-gray-700 mb-2">Kategori <span class="text-red-500">*</span></label><input name="tur" list="categoryList" value="${p.tur||''}" class="w-full px-5 py-3 border border-gray-300 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none" placeholder="Seçin veya yeni yazın" required><datalist id="categoryList">${cats.map(c=>`<option value="${c}">${c}</option>`).join('')}</datalist></div>
+                    </div>
+                    <div class="flex gap-4 mt-8">
+                        <button type="button" id="admin-cancelProductForm" class="flex-1 py-3.5 bg-gray-200 text-gray-700 font-bold text-lg rounded-2xl hover:bg-gray-300">İptal</button>
+                        <button type="submit" class="flex-1 py-3.5 bg-blue-600 text-white font-bold text-lg rounded-2xl hover:bg-blue-700 shadow-lg">${editingProductId?'Güncelle':'Ekle'}</button>
+                    </div>
+                </form>`;
+            }
+            return `<div class="flex justify-between items-center mb-6"><h3 class="font-bold text-gray-700 text-xl">Ürün Listesi</h3><button id="admin-newProductBtn" class="px-5 py-2.5 bg-green-600 text-white text-base font-bold rounded-2xl hover:bg-green-700"><i class="fas fa-plus mr-2"></i>Yeni Ürün</button></div>
+            <div class="admin-table-container"><table class="w-full text-base text-left bg-white">
+                <thead class="text-sm uppercase bg-gray-50 text-gray-500"><tr><th>Ürün Adı</th><th>Kategori</th><th class="text-right">Fiyat</th><th class="text-right">İşlem</th></tr></thead>
+                <tbody class="divide-y divide-gray-100">
+                    ${products.map(p=>`<tr class="hover:bg-gray-50"><td class="font-medium text-gray-900">${p.ad}</td><td class="text-gray-500">${p.tur}</td><td class="text-right font-bold text-gray-700">${parseFloat(p.fiyat).toFixed(2)} ₺</td>
+                    <td><div class="admin-action-buttons"><button class="admin-action-btn admin-edit-btn admin-editProductBtn" data-id="${p.id}"><i class="fas fa-edit"></i></button><button class="admin-action-btn admin-delete-btn admin-deleteProductBtn" data-id="${p.id}"><i class="fas fa-trash"></i></button></div></td></tr>`).join('')}
+                </tbody>
+            </table></div>`;
+        };
+
+        const tableContent=()=>`
+            <div class="flex justify-between items-center mb-6"><h3 class="font-bold text-gray-700 text-xl">Masa Listesi</h3>
+                <form id="admin-tableForm" class="flex gap-3">
+                    <input type="number" name="masano" placeholder="No" class="w-24 px-4 py-3 border rounded-2xl text-base focus:outline-none focus:ring-2 focus:ring-blue-500" required>
+                    <button type="submit" class="px-5 py-2.5 bg-green-600 text-white text-base font-bold rounded-2xl hover:bg-green-700"><i class="fas fa-plus mr-1"></i>Ekle</button>
+                </form>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-5">
+                ${tables.sort((a,b)=>a.masano-b.masano).map(t=>`
+                <div class="card p-5 flex flex-col gap-4">
+                    <div class="flex justify-between items-center pb-2 border-b border-gray-50">
+                        <span class="font-bold text-xl text-gray-800 flex items-center gap-2"><div class="w-3 h-3 rounded-full bg-green-500"></div>Masa ${t.masano}</span>
+                        <button class="admin-deleteTableBtn w-9 h-9 rounded-xl bg-red-50 text-red-500 hover:bg-red-100" data-masano="${t.masano}"><i class="fas fa-trash text-sm"></i></button>
+                    </div>
+                    <div>
+                        <label class="text-sm font-bold text-gray-400 uppercase mb-1 block">Garson</label>
+                        <select class="admin-assignWaiter w-full border border-gray-200 rounded-xl p-3 text-base bg-gray-50 focus:ring-2 focus:ring-blue-500 outline-none" data-masano="${t.masano}">
+                            <option value="">-- Seçiniz --</option>
+                            ${waiters.map(w=>`<option value="${w}" ${t.garson===w?'selected':''}>${w}</option>`).join('')}
+                        </select>
+                    </div>
+                </div>`).join('')}
+            </div>`;
+
+        return `<div class="card overflow-hidden">
+            <div class="flex border-b border-gray-100 bg-gray-50 p-2 gap-2">
+                <button data-tab="users" class="flex-1 py-3.5 text-base font-bold text-center rounded-2xl ${at==='users'?'bg-white text-blue-600 shadow-sm':'text-gray-500 hover:bg-gray-200'}">Kullanıcılar</button>
+                <button data-tab="products" class="flex-1 py-3.5 text-base font-bold text-center rounded-2xl ${at==='products'?'bg-white text-blue-600 shadow-sm':'text-gray-500 hover:bg-gray-200'}">Ürünler</button>
+                <button data-tab="tables" class="flex-1 py-3.5 text-base font-bold text-center rounded-2xl ${at==='tables'?'bg-white text-blue-600 shadow-sm':'text-gray-500 hover:bg-gray-200'}">Masalar</button>
+            </div>
+            <div class="p-6 min-h-[400px]">${at==='users'?userContent():at==='products'?productContent():tableContent()}</div>
+        </div>`;
+    }
+
+    function attachAdminPanelListeners({users,products,tables,waiters}) {
+        document.querySelectorAll('button[data-tab]').forEach(btn=>btn.onclick=()=>{ state.admin.activeTab=btn.dataset.tab; renderAdmin(); });
+
+        if(document.getElementById('admin-newUserBtn')) document.getElementById('admin-newUserBtn').onclick=()=>{ state.admin.showUserForm=true; state.admin.editingUserId=null; renderAdmin(); };
+        if(document.getElementById('admin-cancelUserForm')) document.getElementById('admin-cancelUserForm').onclick=()=>{ state.admin.showUserForm=false; renderAdmin(); };
+        document.querySelectorAll('.admin-editUserBtn').forEach(btn=>btn.onclick=()=>{ state.admin.showUserForm=true; state.admin.editingUserId=btn.dataset.userid; renderAdmin(); });
+        document.querySelectorAll('.admin-deleteUserBtn').forEach(btn=>btn.onclick=async()=>{
+            if(await showConfirmation('Kullanıcı silinsin mi?')) { try{ await DB.handleDeleteUser({userId:btn.dataset.userid}); renderAdmin(); }catch(e){showNotification(e.message,'error');} }
+        });
+        const userForm=document.getElementById('admin-userForm');
+        if(userForm) userForm.onsubmit=async(e)=>{
+            e.preventDefault();
+            const fd=Object.fromEntries(new FormData(e.target));
+            try {
+                if(state.admin.editingUserId) await DB.handleUpdateUser({originalId:state.admin.editingUserId,updatedUser:fd});
+                else await DB.handleAddUser({newUser:fd});
+                state.admin.showUserForm=false; renderAdmin(); showNotification('İşlem başarılı','success');
+            } catch(err){ showNotification(err.message,'error'); }
+        };
+
+        if(document.getElementById('admin-newProductBtn')) document.getElementById('admin-newProductBtn').onclick=()=>{ state.admin.showProductForm=true; state.admin.editingProductId=null; renderAdmin(); };
+        if(document.getElementById('admin-cancelProductForm')) document.getElementById('admin-cancelProductForm').onclick=()=>{ state.admin.showProductForm=false; renderAdmin(); };
+        document.querySelectorAll('.admin-editProductBtn').forEach(btn=>btn.onclick=()=>{ state.admin.showProductForm=true; state.admin.editingProductId=btn.dataset.id; renderAdmin(); });
+        document.querySelectorAll('.admin-deleteProductBtn').forEach(btn=>btn.onclick=async()=>{
+            if(await showConfirmation('Ürün silinsin mi?')) { try{ await DB.handleDeleteProduct({productId:btn.dataset.id}); renderAdmin(); }catch(e){showNotification(e.message,'error');} }
+        });
+        const prodForm=document.getElementById('admin-productForm');
+        if(prodForm) prodForm.onsubmit=async(e)=>{
+            e.preventDefault();
+            const fd=Object.fromEntries(new FormData(e.target));
+            const pd={ad:fd.ad?.trim(),fiyat:parseFloat(fd.fiyat),tur:fd.tur?.trim()};
+            if(!pd.ad||!pd.tur||isNaN(pd.fiyat)){showNotification('Lütfen zorunlu alanları doldurun','error');return;}
+            try {
+                if(state.admin.editingProductId) await DB.handleUpdateProduct({originalId:state.admin.editingProductId,updatedProduct:pd});
+                else await DB.handleAddProduct({newProduct:pd});
+                state.admin.showProductForm=false; state.admin.editingProductId=null; renderAdmin(); showNotification('Ürün kaydedildi','success');
+            } catch(err){showNotification(`Hata: ${err.message}`,'error');}
+        };
+
+        const tableForm=document.getElementById('admin-tableForm');
+        if(tableForm) tableForm.onsubmit=async(e)=>{
+            e.preventDefault();
+            try{ await DB.handleAddTable(e.target.masano.value); renderAdmin(); showNotification('Masa eklendi','success'); }
+            catch(err){ showNotification(err.message,'error'); }
+        };
+        document.querySelectorAll('.admin-deleteTableBtn').forEach(btn=>btn.onclick=async()=>{
+            if(await showConfirmation(`Masa ${btn.dataset.masano} silinsin mi?`)){
+                try{ await DB.handleDeleteTable({masano:btn.dataset.masano}); renderAdmin(); showNotification('Masa silindi','success'); }
+                catch(err){ showNotification(err.message,'error'); }
+            }
+        });
+        document.querySelectorAll('.admin-assignWaiter').forEach(sel=>sel.onchange=async()=>{
+            try{ await DB.handleUpdateTableWaiter(sel.dataset.masano, sel.value); showNotification('Garson atandı','success'); }
+            catch(err){ showNotification(err.message,'error'); }
+        });
+    }
+
+    // ================================================================
+    // DOMContentLoaded
+    // ================================================================
+    document.addEventListener('DOMContentLoaded', () => {
+        initializeDarkMode();
+
+        try {
+            const stored = sessionStorage.getItem('currentUser');
+            if (stored) {
+                currentUser = JSON.parse(stored);
+                waitForDB(() => initializeAppUI());
+            }
+        } catch(e) {}
+
+        document.getElementById('loginForm').onsubmit = (e) => { e.preventDefault(); waitForDB(handleLogin); };
+        document.getElementById('confirmBtn').onclick  = () => hideConfirmation(true);
+        document.getElementById('cancelBtn').onclick   = () => hideConfirmation(false);
+        document.getElementById('mobileMenuToggle')?.addEventListener('click', openMobileMenu);
+        document.getElementById('closeMobileMenu')?.addEventListener('click', closeMobileMenu);
+        document.getElementById('mobileSidebarOverlay')?.addEventListener('click', closeMobileMenu);
+        document.getElementById('darkModeToggle')?.addEventListener('click', toggleDarkMode);
+        document.getElementById('sidebarLogoutBtn')?.addEventListener('click', handleLogout);
+        document.getElementById('mobileLogoutBtn')?.addEventListener('click', handleLogout);
+
+        // Sayfa görünmezken listener'ları koru (onSnapshot kendi yönetir), görününce garson kontrolü yenile
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && currentUser?.rol === 'Garson') startGarsonHazirListener();
+        });
+    });
+    </script>
+</body>
+</html>
